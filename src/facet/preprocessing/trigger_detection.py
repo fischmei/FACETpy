@@ -22,11 +22,14 @@ from ..helpers.crosscorr import crosscorrelation
 
 @register_processor
 class TriggerDetector(Processor):
-    """Detect triggers from annotations or stim channels using a regex pattern.
+    """Detect triggers from annotations, STIM, or discrete trigger channels.
 
     Searches the raw data for events whose description (annotation) or integer
-    value (stim channel) matches the supplied regular expression. Detected
-    trigger sample positions are stored in ``context.metadata.triggers``.
+    value (STIM channel) matches the supplied regular expression. If no typed
+    STIM/annotation events match, it can also detect a zero-baseline discrete
+    trigger channel that was loaded as regular data, such as an EEGLAB
+    ``Status`` channel. Detected trigger sample positions are stored in
+    ``context.metadata.triggers``.
 
     The artifact length is estimated from the median inter-trigger interval;
     volume-level gaps in slice-triggered acquisitions are detected
@@ -119,22 +122,210 @@ class TriggerDetector(Processor):
             List of MNE-style event rows ``[sample, prev_id, event_id]``.
         """
         pattern = re.compile(self.regex)
-        stim_channels = mne.pick_types(raw.info, meg=False, eeg=False, stim=True)
+        stim_events = self._find_stim_events(raw, pattern)
+        if len(stim_events) > 0:
+            return stim_events
 
-        if len(stim_channels) > 0:
-            logger.debug("Found {} stim channels", len(stim_channels))
+        logger.debug("No matching STIM events, searching annotations")
+        events_obj = mne.events_from_annotations(raw, verbose=False)
+        logger.debug("Event types: {}", events_obj[1])
+        annotation_events = list(mne.events_from_annotations(raw, regexp=self.regex, verbose=False)[0])
+        if len(annotation_events) > 0:
+            return annotation_events
+
+        return self._find_discrete_channel_events(raw, pattern)
+
+    def _find_stim_events(self, raw: mne.io.Raw, pattern: re.Pattern) -> list:
+        """Find matching events in all channels already marked as STIM."""
+        stim_channels = mne.pick_types(raw.info, meg=False, eeg=False, stim=True)
+        if len(stim_channels) == 0:
+            return []
+
+        logger.debug("Found {} stim channels", len(stim_channels))
+        matched_events = []
+
+        for channel_idx in stim_channels:
+            channel_name = raw.ch_names[channel_idx]
             events = mne.find_events(
                 raw,
-                stim_channel=raw.ch_names[stim_channels[0]],
+                stim_channel=channel_name,
                 initial_event=True,
                 verbose=False,
             )
-            return [event for event in events if pattern.search(str(event[2]))]
+            if len(events) == 0:
+                continue
 
-        logger.debug("No stim channels, searching annotations")
-        events_obj = mne.events_from_annotations(raw, verbose=False)
-        logger.debug("Event types: {}", events_obj[1])
-        return list(mne.events_from_annotations(raw, regexp=self.regex, verbose=False)[0])
+            if self._allows_positive_trigger_fallback(pattern):
+                channel_matches = [event for event in events if int(event[2]) > 0]
+            else:
+                channel_matches = [event for event in events if pattern.search(str(event[2]))]
+            if channel_matches:
+                logger.debug("Found {} matching STIM events in {}", len(channel_matches), channel_name)
+                matched_events.extend(channel_matches)
+                continue
+
+        if matched_events:
+            return self._sort_events(matched_events)
+        return []
+
+    def _find_discrete_channel_events(self, raw: mne.io.Raw, pattern: re.Pattern) -> list:
+        """Find a trigger pulse train stored in a non-STIM data channel.
+
+        Some loaders, notably EEGLAB, can expose trigger/status channels as
+        ordinary EEG channels. We only accept channels that look discrete and
+        contain zero-baseline positive pulses, which avoids mistaking normal EEG
+        fluctuations for triggers.
+        """
+        stim_channels = set(mne.pick_types(raw.info, meg=False, eeg=False, stim=True))
+        candidates = []
+
+        for channel_idx, channel_name in enumerate(raw.ch_names):
+            if channel_idx in stim_channels:
+                continue
+
+            data = raw.get_data(picks=[channel_idx])[0]
+            candidate = self._events_from_discrete_channel(raw, channel_idx, data, pattern)
+            if candidate is None:
+                continue
+
+            logger.debug(
+                "Trigger candidate {}: {} events from values {}",
+                channel_name,
+                len(candidate["events"]),
+                candidate["values"],
+            )
+            candidates.append(candidate)
+
+        if len(candidates) == 0:
+            return []
+
+        candidates.sort(key=lambda item: item["score"], reverse=True)
+        best = candidates[0]
+        if len(candidates) > 1:
+            logger.warning(
+                "Multiple discrete trigger-like channels found ({}); using {}",
+                ", ".join(candidate["channel_name"] for candidate in candidates),
+                best["channel_name"],
+            )
+
+        logger.info(
+            "Using trigger channel '{}' with {} detected trigger(s)",
+            best["channel_name"],
+            len(best["events"]),
+        )
+        return self._sort_events(best["events"])
+
+    def _events_from_discrete_channel(
+        self,
+        raw: mne.io.Raw,
+        channel_idx: int,
+        data: np.ndarray,
+        pattern: re.Pattern,
+    ) -> dict | None:
+        """Build MNE-style events from one discrete zero-to-positive channel."""
+        if data.size == 0 or not np.all(np.isfinite(data)):
+            return None
+
+        quantized = self._quantize_channel(data)
+        unique_values = np.unique(quantized)
+        zero_tolerance = self._zero_tolerance(unique_values)
+        nonzero_values = [value for value in unique_values if abs(value) > zero_tolerance]
+        if len(nonzero_values) == 0 or not self._is_discrete_trigger_channel(unique_values, zero_tolerance):
+            return None
+
+        if self._allows_positive_trigger_fallback(pattern):
+            matched_values = [value for value in nonzero_values if value > zero_tolerance]
+            active = quantized > zero_tolerance
+            event_value = self._event_id_from_values(matched_values)
+        else:
+            matched_values = [value for value in nonzero_values if pattern.search(self._format_trigger_value(value))]
+            if not matched_values:
+                return None
+            active = np.isin(quantized, matched_values)
+            event_value = self._event_id_from_values(matched_values)
+
+        if len(matched_values) == 0:
+            return None
+
+        rising_edges = self._rising_edges(active)
+        if len(rising_edges) == 0:
+            return None
+
+        events = [[int(sample + raw.first_samp), 0, event_value] for sample in rising_edges]
+        channel_name = raw.ch_names[channel_idx]
+        score = (
+            int(self._has_trigger_name_hint(channel_name)) * 1000
+            + int(bool(matched_values)) * 100
+            - len(unique_values)
+        )
+        return {
+            "channel_name": channel_name,
+            "events": events,
+            "score": score,
+            "values": [self._format_trigger_value(value) for value in matched_values],
+        }
+
+    @staticmethod
+    def _sort_events(events: list) -> list:
+        """Return events sorted by sample index."""
+        return sorted(events, key=lambda event: int(event[0]))
+
+    @staticmethod
+    def _quantize_channel(data: np.ndarray) -> np.ndarray:
+        """Round tiny floating-point noise without changing trigger codes."""
+        return np.round(data.astype(float), decimals=12)
+
+    @staticmethod
+    def _zero_tolerance(values: np.ndarray) -> float:
+        """Compute a scale-aware tolerance for deciding whether a code is zero."""
+        scale = float(np.max(np.abs(values))) if values.size else 0.0
+        return max(np.finfo(float).eps, scale * 1e-9)
+
+    @staticmethod
+    def _is_discrete_trigger_channel(values: np.ndarray, zero_tolerance: float) -> bool:
+        """Check whether channel values look like trigger codes, not EEG."""
+        has_zero = np.any(np.abs(values) <= zero_tolerance)
+        has_positive = np.any(values > zero_tolerance)
+        return has_zero and has_positive and len(values) <= 128
+
+    @staticmethod
+    def _rising_edges(active: np.ndarray) -> np.ndarray:
+        """Return the first sample of each active pulse."""
+        if active.size == 0 or np.all(active) or not np.any(active):
+            return np.array([], dtype=np.int64)
+
+        edges = np.flatnonzero(np.diff(active.astype(np.int8)) == 1) + 1
+        if active[0]:
+            edges = np.r_[0, edges]
+        return edges.astype(np.int64)
+
+    @staticmethod
+    def _format_trigger_value(value: float) -> str:
+        """Format a numeric trigger value for regex matching and logging."""
+        rounded = round(float(value))
+        if np.isclose(value, rounded):
+            return str(int(rounded))
+        return f"{value:g}"
+
+    @staticmethod
+    def _event_id_from_values(values: list[float]) -> int:
+        """Choose a stable positive event id for MNE-style event rows."""
+        positive_values = [value for value in values if value > 0]
+        if not positive_values:
+            return 1
+        return max(1, int(round(float(max(positive_values)))))
+
+    @staticmethod
+    def _has_trigger_name_hint(channel_name: str) -> bool:
+        """Return whether a channel name commonly denotes triggers."""
+        normalized = channel_name.lower().replace(" ", "").replace("_", "")
+        hints = ("status", "stim", "trigger", "trig", "marker", "event", "ttl", "sync")
+        return any(hint in normalized for hint in hints)
+
+    @staticmethod
+    def _allows_positive_trigger_fallback(pattern: re.Pattern) -> bool:
+        """Treat non-zero pulses as triggers for the common trigger value regex."""
+        return pattern.search("1") is not None
 
     def _compute_artifact_metadata(self, triggers: np.ndarray) -> dict:
         """Estimate artifact length and detect volume gaps from trigger spacing.
