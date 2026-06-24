@@ -33,6 +33,10 @@ dependencies = [
     "neurokit2>=0.2.7,<0.3.0",
     "rich>=14.2.0,<15.0.0",
     "eeglabio>=0.1.3,<0.2.0",
+    "pyqt6>=6.11.0",
+    "pyside6>=6.11.1",
+    "pyqt5>=5.15.11",
+    "pyside2>=5.15.2.1",
 ]
 
 [project.optional-dependencies]
