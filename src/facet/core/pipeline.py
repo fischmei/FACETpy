@@ -8,6 +8,8 @@ Date: 2025-01-12
 """
 
 from collections.abc import Callable
+from dataclasses import dataclass
+from pathlib import Path
 from typing import Any
 
 from loguru import logger
@@ -446,6 +448,106 @@ class BatchResult:
                 row.update(result.metrics_df.to_dict())
             rows.append(row)
         return pd.DataFrame(rows)
+
+
+@dataclass(frozen=True)
+class ChunkSpec:
+    """Description of one fixed-length raw-data chunk."""
+
+    index: int
+    total: int
+    start_sample: int
+    stop_sample: int
+    sfreq: float
+    output_path: Path
+
+    @property
+    def duration_seconds(self) -> float:
+        """Return chunk duration in seconds."""
+        return (self.stop_sample - self.start_sample) / self.sfreq
+
+
+class ChunkedPipelineResult:
+    """Result of :meth:`Pipeline.run_chunked`.
+
+    Behaves like a list of :class:`PipelineResult` objects and keeps the chunk
+    windows and numbered output paths together for reporting.
+    """
+
+    def __init__(
+        self,
+        results: list[PipelineResult],
+        chunks: list[ChunkSpec],
+        source_path: str,
+        output_dir: str,
+        execution_time: float,
+        manifest_path: Path | None = None,
+    ) -> None:
+        self._results = results
+        self.chunks = chunks
+        self.source_path = source_path
+        self.output_dir = output_dir
+        self.execution_time = execution_time
+        self.manifest_path = manifest_path
+
+    def __iter__(self):
+        return iter(self._results)
+
+    def __getitem__(self, index):
+        return self._results[index]
+
+    def __len__(self) -> int:
+        return len(self._results)
+
+    @property
+    def output_paths(self) -> list[Path]:
+        """Return numbered chunk output paths."""
+        return [chunk.output_path for chunk in self.chunks]
+
+    @property
+    def success(self) -> bool:
+        """Return ``True`` only when every chunk succeeded."""
+        return bool(self._results) and all(result.success for result in self._results)
+
+    def was_successful(self) -> bool:
+        """Check if all chunk pipelines succeeded."""
+        return self.success
+
+    def print_summary(self) -> None:
+        """Print a compact chunk-processing summary."""
+        from rich import box
+        from rich.console import Console as RichConsole
+        from rich.table import Table
+
+        con = get_console().get_rich_console() or RichConsole(highlight=False)
+        table = Table(
+            title="Chunked Pipeline Results",
+            show_header=True,
+            header_style="bold cyan",
+            box=box.SIMPLE_HEAVY,
+            padding=(0, 1),
+        )
+        table.add_column("Chunk", no_wrap=True)
+        table.add_column("Samples")
+        table.add_column("Duration")
+        table.add_column("Status")
+        table.add_column("Output")
+
+        for chunk, result in zip(self.chunks, self._results, strict=False):
+            status = "[green]OK[/green]" if result.success else "[red]FAIL[/red]"
+            sample_range = f"{chunk.start_sample}:{chunk.stop_sample}"
+            table.add_row(
+                f"{chunk.index}/{chunk.total}",
+                sample_range,
+                f"{chunk.duration_seconds:.1f}s",
+                status,
+                str(chunk.output_path),
+            )
+
+        con.print(table)
+        con.print(f"Done in {self.execution_time:.2f}s")
+        if self.manifest_path is not None:
+            con.print(f"Manifest: {self.manifest_path}")
 
 
 class Pipeline:
@@ -943,6 +1045,703 @@ class Pipeline:
                 raise result.error
 
         return BatchResult(results, labels=labels)
+
+    def run_chunked(
+        self,
+        input_path: str,
+        output_dir: str,
+        output_extension: str = ".edf",
+        output_stem: str | None = None,
+        loader_kwargs: dict[str, Any] | None = None,
+        exporter_factory: Callable[[str], Processor] | None = None,
+        min_chunks: int = 2,
+        max_chunks: int = 128,
+        memory_budget_mb: float | None = None,
+        memory_fraction: float = 0.5,
+        processing_memory_multiplier: float = 4.0,
+        overwrite: bool = True,
+        parallel: bool = False,
+        n_jobs: int = -1,
+        channel_sequential: bool = False,
+        show_progress: bool = True,
+        on_error: str = "raise",
+        keep_raw: bool = False,
+        chunk_by_trigger_sections: bool | None = None,
+        trigger_section_padding_seconds: float = 10.0,
+        trigger_section_min_triggers: int = 16,
+        trigger_section_gap_seconds: float | None = None,
+        trigger_section_max_sections: int = 2,
+    ) -> ChunkedPipelineResult:
+        """Run a processing pipeline over bounded chunks of one input file.
+
+        The input is opened lazily to inspect its sampling rate and sample
+        count. If the pipeline contains a ``TriggerDetector``, chunks are built
+        around trigger sections by default so that every AAS chunk contains
+        triggers. Otherwise the method falls back to fixed-length chunks,
+        starting with ``min_chunks`` and increasing the division count until the
+        estimated peak memory per chunk fits inside the requested or available
+        memory budget.
+
+        The pipeline passed to ``run_chunked`` should contain processing steps
+        only. Loading and exporting are handled here so that every chunk gets a
+        fresh bounded :class:`~facet.io.Loader` and a numbered output file.
+
+        Parameters
+        ----------
+        input_path : str
+            Source EEG file or MFF directory accepted by :class:`facet.io.Loader`.
+        output_dir : str
+            Folder that will receive numbered corrected chunk files.
+        output_extension : str, optional
+            Export extension used by :class:`facet.io.Exporter` (default:
+            ``".edf"``).
+        output_stem : str, optional
+            Base name for chunk files. Defaults to the input file stem.
+        loader_kwargs : dict, optional
+            Extra keyword arguments forwarded to each chunk loader.
+        exporter_factory : callable, optional
+            Factory receiving an output path and returning an exporter
+            processor. Defaults to ``Exporter(path=..., overwrite=...)``.
+        min_chunks, max_chunks : int
+            Search range for the automatic chunk count.
+        memory_budget_mb : float, optional
+            Explicit per-chunk memory budget. If omitted, a fraction of
+            currently available system memory is used when detectable.
+        memory_fraction : float
+            Fraction of available memory to use when ``memory_budget_mb`` is
+            not supplied.
+        processing_memory_multiplier : float
+            Safety multiplier for intermediate arrays and copies.
+        overwrite : bool
+            Passed to the default exporter.
+        on_error : {"raise", "continue"}
+            Whether to stop on the first failed chunk or return failed results.
+        keep_raw : bool
+            If ``False``, release each successful chunk's Raw object after
+            export so only metadata/results remain in memory.
+        chunk_by_trigger_sections : bool, optional
+            If ``True``, build one output chunk per detected trigger section.
+            If ``None`` (default), this is enabled automatically when the
+            pipeline contains a ``TriggerDetector``.
+        trigger_section_padding_seconds : float
+            Seconds to include before the first trigger and after the last
+            trigger in each detected section.
+        trigger_section_min_triggers : int
+            Minimum trigger count required for a trigger cluster to be treated
+            as a section.
+        trigger_section_gap_seconds : float, optional
+            Explicit gap threshold for splitting trigger sections. If omitted,
+            a robust threshold is estimated from the trigger spacing.
+        trigger_section_max_sections : int
+            Maximum number of trigger sections to export.
+        """
+        import gc
+        import math
+        import os
+        import time
+
+        import mne
+
+        from ..io.exporters import _EXTENSION_EXPORTERS
+        from ..io.exporters import Exporter as _Exporter
+        from ..io.loaders import Loader as _Loader
+
+        if min_chunks < 1:
+            raise ValueError("min_chunks must be >= 1")
+        if max_chunks < min_chunks:
+            raise ValueError("max_chunks must be >= min_chunks")
+        if on_error not in {"raise", "continue"}:
+            raise ValueError("on_error must be 'raise' or 'continue'")
+        if not (0 < memory_fraction <= 1):
+            raise ValueError("memory_fraction must be in (0, 1]")
+        if processing_memory_multiplier <= 0:
+            raise ValueError("processing_memory_multiplier must be positive")
+        if trigger_section_padding_seconds < 0:
+            raise ValueError("trigger_section_padding_seconds must be >= 0")
+        if trigger_section_min_triggers < 1:
+            raise ValueError("trigger_section_min_triggers must be >= 1")
+        if trigger_section_gap_seconds is not None and trigger_section_gap_seconds <= 0:
+            raise ValueError("trigger_section_gap_seconds must be positive when provided")
+        if trigger_section_max_sections < 1:
+            raise ValueError("trigger_section_max_sections must be >= 1")
+
+        exporter_types = tuple(_EXTENSION_EXPORTERS.values()) + (_Exporter,)
+        for proc in self.processors:
+            if isinstance(proc, _Loader):
+                raise ValueError("run_chunked() handles loading; remove Loader from this pipeline")
+            if isinstance(proc, exporter_types):
+                raise ValueError("run_chunked() handles exporting; remove exporters from this pipeline")
+
+        loader_kwargs = dict(loader_kwargs or {})
+        for forbidden in ("start_sample", "stop_sample", "preload"):
+            if forbidden in loader_kwargs:
+                raise ValueError(f"loader_kwargs must not include {forbidden!r}; run_chunked controls it")
+
+        start_time = time.time()
+        output_root = Path(output_dir)
+        output_root.mkdir(parents=True, exist_ok=True)
+        extension = self._normalise_chunk_extension(output_extension)
+        stem = output_stem or self._source_stem(input_path)
+
+        # Probe the file without loading signal samples, mirroring MNE's
+        # fixed-length epoch workflow where epochs can be created with
+        # preload=False.
+        probe_context = _Loader(path=input_path, preload=False, **loader_kwargs).execute(None)
+        probe_raw = probe_context.get_raw()
+        n_times = int(probe_raw.n_times)
+        sfreq = float(probe_raw.info["sfreq"])
+        n_channels = len(probe_raw.ch_names)
+        sample_bytes = self._raw_sample_bytes(probe_raw)
+        peak_sample_multiplier = self._peak_sample_multiplier()
+
+        memory_budget = self._memory_budget_bytes(memory_budget_mb, memory_fraction, os)
+        trigger_detector = self._find_trigger_detector_for_chunking()
+        if chunk_by_trigger_sections is None:
+            use_trigger_sections = trigger_detector is not None
+        else:
+            use_trigger_sections = chunk_by_trigger_sections
+
+        trigger_section_chunks: list[ChunkSpec] | None = None
+        chunking_mode = "fixed_length"
+        if use_trigger_sections:
+            if trigger_detector is None:
+                raise ValueError(
+                    "chunk_by_trigger_sections=True requires a TriggerDetector in the pipeline"
+                )
+
+            trigger_context = self._detect_triggers_for_chunking(probe_context)
+            triggers = trigger_context.get_triggers()
+            if triggers is None or len(triggers) == 0:
+                raise PipelineError("Cannot build trigger-section chunks: no triggers were detected")
+
+            trigger_section_chunks = self._make_trigger_section_chunks(
+                raw=probe_raw,
+                triggers=triggers,
+                output_dir=output_root,
+                output_stem=stem,
+                extension=extension,
+                padding_seconds=trigger_section_padding_seconds,
+                min_triggers=trigger_section_min_triggers,
+                gap_seconds=trigger_section_gap_seconds,
+                max_sections=trigger_section_max_sections,
+            )
+            chunking_mode = "trigger_sections"
+            attempt_chunks = len(trigger_section_chunks)
+            retry_limit = attempt_chunks
+
+            logger.info(
+                "Chunking {} into {} trigger-section window(s): {} samples, {} channels, {} Hz",
+                input_path,
+                len(trigger_section_chunks),
+                n_times,
+                n_channels,
+                sfreq,
+            )
+        else:
+            n_chunks = self._choose_chunk_count(
+                n_times=n_times,
+                n_channels=n_channels,
+                sample_bytes=sample_bytes,
+                peak_sample_multiplier=peak_sample_multiplier,
+                processing_memory_multiplier=processing_memory_multiplier,
+                memory_budget=memory_budget,
+                min_chunks=min_chunks,
+                max_chunks=max_chunks,
+                math_module=math,
+            )
+
+            logger.info(
+                "Chunking {} into {} fixed-length part(s): {} samples, {} channels, {} Hz",
+                input_path,
+                n_chunks,
+                n_times,
+                n_channels,
+                sfreq,
+            )
+
+            attempt_chunks = n_chunks
+            retry_limit = max_chunks
+
+        while attempt_chunks <= retry_limit:
+            if trigger_section_chunks is not None:
+                chunks = trigger_section_chunks
+            else:
+                chunks = self._make_fixed_length_chunks(
+                    raw=probe_raw,
+                    n_chunks=attempt_chunks,
+                    output_dir=output_root,
+                    output_stem=stem,
+                    extension=extension,
+                    mne_module=mne,
+                    math_module=math,
+                )
+            results: list[PipelineResult] = []
+
+            try:
+                for chunk in chunks:
+                    logger.info(
+                        "Processing chunk {}/{}: samples {}:{} -> {}",
+                        chunk.index,
+                        chunk.total,
+                        chunk.start_sample,
+                        chunk.stop_sample,
+                        chunk.output_path,
+                    )
+
+                    chunk_loader = _Loader(
+                        path=input_path,
+                        preload=True,
+                        start_sample=chunk.start_sample,
+                        stop_sample=chunk.stop_sample,
+                        **loader_kwargs,
+                    )
+                    chunk_context = chunk_loader.execute(None)
+                    chunk_context.metadata.custom["chunk"] = {
+                        "index": chunk.index,
+                        "total": chunk.total,
+                        "start_sample": chunk.start_sample,
+                        "stop_sample": chunk.stop_sample,
+                        "chunking_mode": chunking_mode,
+                        "source_path": input_path,
+                    }
+
+                    exporter = (
+                        exporter_factory(str(chunk.output_path))
+                        if exporter_factory is not None
+                        else _Exporter(path=str(chunk.output_path), overwrite=overwrite)
+                    )
+                    chunk_pipeline = Pipeline(
+                        [*self.processors, exporter],
+                        name=f"{self.name} chunk {chunk.index}/{chunk.total}",
+                    )
+                    result = chunk_pipeline.run(
+                        initial_context=chunk_context,
+                        parallel=parallel,
+                        n_jobs=n_jobs,
+                        channel_sequential=channel_sequential,
+                        show_progress=show_progress,
+                    )
+
+                    if not result.success:
+                        if self._is_memory_failure(result.error):
+                            raise MemoryError(str(result.error)) from result.error
+                        if on_error == "raise":
+                            raise result.error
+
+                    if result.success and not keep_raw:
+                        result.release_raw()
+
+                    results.append(result)
+                    gc.collect()
+
+                execution_time = time.time() - start_time
+                manifest_path = self._write_chunk_manifest(
+                    output_root,
+                    source_path=input_path,
+                    chunks=chunks,
+                    results=results,
+                    execution_time=execution_time,
+                    memory_budget=memory_budget,
+                    chunking_mode=chunking_mode,
+                )
+                return ChunkedPipelineResult(
+                    results=results,
+                    chunks=chunks,
+                    source_path=input_path,
+                    output_dir=str(output_root),
+                    execution_time=execution_time,
+                    manifest_path=manifest_path,
+                )
+
+            except MemoryError:
+                if trigger_section_chunks is not None or attempt_chunks >= retry_limit:
+                    raise
+                attempt_chunks += 1
+                logger.warning("Chunk run exceeded memory; retrying with {} chunks", attempt_chunks)
+                gc.collect()
+
+        raise PipelineError("Chunked processing failed before producing results")
+
+    def _find_trigger_detector_for_chunking(self) -> Processor | None:
+        """Return the first TriggerDetector-like processor in this pipeline."""
+        for proc in self.processors:
+            if proc.name == "trigger_detector" and hasattr(proc, "regex"):
+                return proc
+        return None
+
+    def _detect_triggers_for_chunking(self, probe_context: ProcessingContext) -> ProcessingContext:
+        """Run the safe pre-trigger steps and TriggerDetector on the lazy probe.
+
+        Only processors that declare ``chunk_probe_safe`` are executed before
+        trigger detection. This allows metadata-only channel removal, such as
+        dropping EGI ``E`` channels, without accidentally filtering or
+        resampling the full recording during the probe pass.
+        """
+        context = probe_context
+
+        for proc in self.processors:
+            if proc.name == "trigger_detector" and hasattr(proc, "regex"):
+                logger.info("Detecting full-file triggers for trigger-section chunking")
+                return proc.execute(context)
+
+            if getattr(proc, "chunk_probe_safe", False):
+                logger.info("Applying {} before trigger-section detection", proc.name)
+                context = proc.execute(context)
+
+        raise PipelineError("Cannot build trigger-section chunks: no TriggerDetector was found")
+
+    @staticmethod
+    def _normalise_chunk_extension(extension: str) -> str:
+        """Return a normalized export extension with a leading dot."""
+        if not extension:
+            raise ValueError("output_extension must not be empty")
+        return extension if extension.startswith(".") else f".{extension}"
+
+    @staticmethod
+    def _source_stem(input_path: str) -> str:
+        """Return a clean file stem, preserving directory-style inputs."""
+        path = Path(input_path)
+        name = path.name
+        for suffix in reversed(path.suffixes):
+            if name.endswith(suffix):
+                name = name[: -len(suffix)]
+        return name or "chunked_output"
+
+    @staticmethod
+    def _raw_sample_bytes(raw) -> int:
+        """Best-effort byte size for one sample in one channel."""
+        import numpy as np
+
+        dtype = getattr(raw, "_dtype", None)
+        if dtype is None:
+            return np.dtype(np.float64).itemsize
+        try:
+            return np.dtype(dtype).itemsize
+        except TypeError:
+            return np.dtype(np.float64).itemsize
+
+    def _peak_sample_multiplier(self) -> float:
+        """Estimate peak sample-count expansion from resampling steps."""
+        current = 1.0
+        peak = 1.0
+        for proc in self.processors:
+            if proc.name == "upsample" and hasattr(proc, "factor"):
+                current *= float(proc.factor)
+            elif proc.name == "downsample" and hasattr(proc, "factor"):
+                current /= float(proc.factor)
+            peak = max(peak, current)
+        return max(1.0, peak)
+
+    @staticmethod
+    def _memory_budget_bytes(memory_budget_mb: float | None, memory_fraction: float, os_module) -> int:
+        """Resolve the per-chunk memory budget in bytes."""
+        if memory_budget_mb is not None:
+            return int(memory_budget_mb * 1024 * 1024)
+
+        try:
+            pages = os_module.sysconf("SC_AVPHYS_PAGES")
+            page_size = os_module.sysconf("SC_PAGE_SIZE")
+            return max(1, int(pages * page_size * memory_fraction))
+        except (AttributeError, OSError, ValueError):
+            fallback_gb = 2
+            logger.warning(
+                "Could not determine available memory; using conservative {} GiB chunk budget",
+                fallback_gb,
+            )
+            return int(fallback_gb * 1024**3 * memory_fraction)
+
+    @staticmethod
+    def _choose_chunk_count(
+        n_times: int,
+        n_channels: int,
+        sample_bytes: int,
+        peak_sample_multiplier: float,
+        processing_memory_multiplier: float,
+        memory_budget: int,
+        min_chunks: int,
+        max_chunks: int,
+        math_module,
+    ) -> int:
+        """Choose the first chunk count whose estimated peak fits the budget."""
+        for n_chunks in range(min_chunks, max_chunks + 1):
+            chunk_samples = int(math_module.ceil(n_times / n_chunks))
+            estimated = (
+                n_channels
+                * chunk_samples
+                * sample_bytes
+                * peak_sample_multiplier
+                * processing_memory_multiplier
+            )
+            if estimated <= memory_budget:
+                logger.info(
+                    "Selected {} chunk(s): estimated peak {:.2f} GiB <= budget {:.2f} GiB",
+                    n_chunks,
+                    estimated / 1024**3,
+                    memory_budget / 1024**3,
+                )
+                return n_chunks
+
+        logger.warning(
+            "Estimated chunk memory still exceeds budget at max_chunks={}; using max_chunks",
+            max_chunks,
+        )
+        return max_chunks
+
+    @staticmethod
+    def _make_fixed_length_chunks(
+        raw,
+        n_chunks: int,
+        output_dir: Path,
+        output_stem: str,
+        extension: str,
+        mne_module,
+        math_module,
+    ) -> list[ChunkSpec]:
+        """Create chunk windows using MNE fixed-length epochs."""
+        n_times = int(raw.n_times)
+        sfreq = float(raw.info["sfreq"])
+        chunk_samples = max(1, int(math_module.ceil(n_times / n_chunks)))
+        duration = chunk_samples / sfreq
+
+        epochs = mne_module.make_fixed_length_epochs(
+            raw,
+            duration=duration,
+            preload=False,
+            reject_by_annotation=False,
+            overlap=0.0,
+            verbose=False,
+        )
+        starts = [int(event[0] - raw.first_samp) for event in epochs.events]
+        starts = sorted({start for start in starts if 0 <= start < n_times})
+
+        if not starts:
+            starts = [0]
+        while starts[-1] + chunk_samples < n_times:
+            starts.append(starts[-1] + chunk_samples)
+
+        total = len(starts)
+        width = max(3, len(str(total)))
+        chunks: list[ChunkSpec] = []
+        for index, start in enumerate(starts, start=1):
+            stop = min(start + chunk_samples, n_times)
+            output_path = output_dir / f"{output_stem}_chunk_{index:0{width}d}_of_{total:0{width}d}{extension}"
+            chunks.append(
+                ChunkSpec(
+                    index=index,
+                    total=total,
+                    start_sample=start,
+                    stop_sample=stop,
+                    sfreq=sfreq,
+                    output_path=output_path,
+                )
+            )
+        return chunks
+
+    @staticmethod
+    def _make_trigger_section_chunks(
+        raw,
+        triggers,
+        output_dir: Path,
+        output_stem: str,
+        extension: str,
+        padding_seconds: float,
+        min_triggers: int,
+        gap_seconds: float | None,
+        max_sections: int,
+    ) -> list[ChunkSpec]:
+        """Create padded chunk windows around dense trigger sections."""
+        import numpy as np
+
+        n_times = int(raw.n_times)
+        sfreq = float(raw.info["sfreq"])
+        trigger_samples = np.asarray(triggers, dtype=np.int64).ravel()
+        trigger_samples = trigger_samples[(trigger_samples >= 0) & (trigger_samples < n_times)]
+        trigger_samples = np.unique(trigger_samples)
+
+        if trigger_samples.size == 0:
+            raise PipelineError("Cannot build trigger-section chunks from an empty trigger array")
+
+        sections = Pipeline._split_trigger_sections(
+            trigger_samples=trigger_samples,
+            sfreq=sfreq,
+            min_triggers=min_triggers,
+            gap_seconds=gap_seconds,
+            max_sections=max_sections,
+        )
+
+        padding_samples = int(round(padding_seconds * sfreq))
+        windows: list[dict[str, int]] = []
+        for index, section in enumerate(sections, start=1):
+            first_trigger = int(section[0])
+            last_trigger = int(section[-1])
+            start = max(0, first_trigger - padding_samples)
+            stop = min(n_times, last_trigger + padding_samples + 1)
+            windows.append(
+                {
+                    "start": start,
+                    "stop": stop,
+                    "trigger_count": int(section.size),
+                    "first_trigger": first_trigger,
+                    "last_trigger": last_trigger,
+                }
+            )
+            logger.info(
+                "Trigger section {}: {} trigger(s), samples {}:{} -> padded chunk {}:{}",
+                index,
+                int(section.size),
+                first_trigger,
+                last_trigger,
+                start,
+                stop,
+            )
+
+        windows = Pipeline._merge_trigger_windows(windows)
+        total = len(windows)
+        width = max(3, len(str(total)))
+        chunks: list[ChunkSpec] = []
+        for index, window in enumerate(windows, start=1):
+            output_path = output_dir / f"{output_stem}_chunk_{index:0{width}d}_of_{total:0{width}d}{extension}"
+            chunks.append(
+                ChunkSpec(
+                    index=index,
+                    total=total,
+                    start_sample=window["start"],
+                    stop_sample=window["stop"],
+                    sfreq=sfreq,
+                    output_path=output_path,
+                )
+            )
+        return chunks
+
+    @staticmethod
+    def _split_trigger_sections(
+        trigger_samples,
+        sfreq: float,
+        min_triggers: int,
+        gap_seconds: float | None,
+        max_sections: int,
+    ) -> list:
+        """Split sorted trigger samples into scan sections."""
+        import numpy as np
+
+        if trigger_samples.size <= 1:
+            return [trigger_samples]
+
+        gaps = np.diff(trigger_samples)
+        if gap_seconds is None:
+            positive_gaps = gaps[gaps > 0]
+            typical_gap = float(np.median(positive_gaps)) if positive_gaps.size else 1.0
+            threshold_samples = max(int(round(10.0 * sfreq)), int(round(5.0 * typical_gap)), 1)
+        else:
+            threshold_samples = max(int(round(gap_seconds * sfreq)), 1)
+
+        split_points = np.flatnonzero(gaps > threshold_samples) + 1
+        sections = [section for section in np.split(trigger_samples, split_points) if section.size > 0]
+        logger.info(
+            "Detected {} trigger-section candidate(s) using a {:.2f}s gap threshold",
+            len(sections),
+            threshold_samples / sfreq,
+        )
+
+        valid_sections = [section for section in sections if section.size >= min_triggers]
+        skipped = len(sections) - len(valid_sections)
+        if skipped > 0:
+            logger.info(
+                "Ignoring {} trigger-section candidate(s) with fewer than {} triggers",
+                skipped,
+                min_triggers,
+            )
+
+        if not valid_sections:
+            logger.warning(
+                "No trigger section reached {} triggers; using all {} trigger(s) as one section",
+                min_triggers,
+                trigger_samples.size,
+            )
+            valid_sections = [trigger_samples]
+
+        if len(valid_sections) > max_sections:
+            logger.warning(
+                "Detected {} trigger sections; keeping the {} largest section(s)",
+                len(valid_sections),
+                max_sections,
+            )
+            valid_sections = sorted(valid_sections, key=lambda section: section.size, reverse=True)[:max_sections]
+            valid_sections = sorted(valid_sections, key=lambda section: int(section[0]))
+
+        return valid_sections
+
+    @staticmethod
+    def _merge_trigger_windows(windows: list[dict[str, int]]) -> list[dict[str, int]]:
+        """Merge padded trigger-section windows that overlap."""
+        if not windows:
+            return []
+
+        merged = [dict(windows[0])]
+        for window in windows[1:]:
+            current = merged[-1]
+            if window["start"] > current["stop"]:
+                merged.append(dict(window))
+                continue
+
+            current["stop"] = max(current["stop"], window["stop"])
+            current["trigger_count"] += window["trigger_count"]
+            current["last_trigger"] = max(current["last_trigger"], window["last_trigger"])
+
+        if len(merged) < len(windows):
+            logger.info(
+                "Merged {} overlapping padded trigger window(s) into {} output chunk(s)",
+                len(windows),
+                len(merged),
+            )
+
+        return merged
+
+    @staticmethod
+    def _write_chunk_manifest(
+        output_dir: Path,
+        source_path: str,
+        chunks: list[ChunkSpec],
+        results: list[PipelineResult],
+        execution_time: float,
+        memory_budget: int,
+        chunking_mode: str = "fixed_length",
+    ) -> Path:
+        """Write a manifest describing all chunk outputs."""
+        import json
+
+        manifest_path = output_dir / "chunks_manifest.json"
+        payload = {
+            "source_path": source_path,
+            "execution_time": execution_time,
+            "memory_budget_bytes": memory_budget,
+            "chunking_mode": chunking_mode,
+            "chunks": [
+                {
+                    "index": chunk.index,
+                    "total": chunk.total,
+                    "start_sample": chunk.start_sample,
+                    "stop_sample": chunk.stop_sample,
+                    "duration_seconds": chunk.duration_seconds,
+                    "output_path": str(chunk.output_path),
+                    "success": result.success if i < len(results) else False,
+                    "error": str(result.error) if i < len(results) and result.error is not None else None,
+                }
+                for i, (chunk, result) in enumerate(zip(chunks, results, strict=False))
+            ],
+        }
+        manifest_path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+        return manifest_path
+
+    @staticmethod
+    def _is_memory_failure(error: Exception | None) -> bool:
+        """Best-effort detection of memory-related failures."""
+        if error is None:
+            return False
+        if isinstance(error, MemoryError):
+            return True
+        text = str(error).lower()
+        return "memory" in text or "cannot allocate" in text or "allocation" in text
 
     def __len__(self) -> int:
         """Get number of processors."""

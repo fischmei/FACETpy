@@ -21,6 +21,8 @@ _configure_logging()
 from .config import get_config, reset_config, set_config
 from .core import (
     BatchResult,
+    ChunkedPipelineResult,
+    ChunkSpec,
     ConditionalProcessor,
     # Parallel execution
     ParallelExecutor,
@@ -89,6 +91,7 @@ from .preprocessing import (
     CutAcquisitionWindow,
     DownSample,
     DropChannels,
+    DropChannelsMatching,
     # Filtering
     Filter,
     HighPassFilter,
@@ -166,6 +169,8 @@ __all__ = [
     "Pipeline",
     "PipelineResult",
     "BatchResult",
+    "ChunkSpec",
+    "ChunkedPipelineResult",
     "SequenceProcessor",
     "ConditionalProcessor",
     "SwitchProcessor",
@@ -212,6 +217,7 @@ __all__ = [
     "RawTransform",
     "PickChannels",
     "DropChannels",
+    "DropChannelsMatching",
     "ChannelStandardizer",
     "PrintMetric",
     "MATLABPreFilter",

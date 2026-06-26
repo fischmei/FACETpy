@@ -14,6 +14,7 @@ from facet.preprocessing import (
     CheckDataReport,
     CutAcquisitionWindow,
     DownSample,
+    DropChannelsMatching,
     HighPassFilter,
     LowPassFilter,
     MagicErasor,
@@ -655,6 +656,30 @@ class TestRawTransform:
         proc = RawTransform("my_custom_step", lambda raw: raw.copy())
         # The name attribute is set on the instance
         assert proc.name == "my_custom_step"
+
+
+@pytest.mark.unit
+class TestDropChannelsMatching:
+    """Tests for regex-based channel removal."""
+
+    def test_drop_egi_e1_to_e128_on_copy(self):
+        """E1-E128 should be removed while non-matching channels are preserved."""
+        ch_names = ["E1", "E2", "E128", "E129", "TREV", "ECG"]
+        ch_types = ["eeg", "eeg", "eeg", "eeg", "stim", "ecg"]
+        data = np.zeros((len(ch_names), 100))
+        raw = mne.io.RawArray(
+            data,
+            mne.create_info(ch_names=ch_names, sfreq=100.0, ch_types=ch_types),
+            verbose=False,
+        )
+        context = ProcessingContext(raw=raw)
+        regex = r"^E(?:[1-9]|[1-9]\d|1[01]\d|12[0-8])$"
+
+        result = context | DropChannelsMatching(regex=regex)
+
+        assert context.get_raw().ch_names == ch_names
+        assert result.get_raw() is not context.get_raw()
+        assert result.get_raw().ch_names == ["E129", "TREV", "ECG"]
 
 
 @pytest.mark.unit

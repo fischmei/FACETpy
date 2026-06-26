@@ -63,7 +63,10 @@ def test_apply_sample_window_validates_bounds(raw_factory):
 
 
 def test_auto_loader_applies_sample_window(monkeypatch, raw_factory):
+    read_preload_values = []
+
     def fake_read_raw_edf(path, *args, **kwargs):
+        read_preload_values.append(kwargs.get("preload"))
         return raw_factory()
 
     monkeypatch.setitem(_EXTENSION_READERS, ".edf", (fake_read_raw_edf, "EDF"))
@@ -77,6 +80,7 @@ def test_auto_loader_applies_sample_window(monkeypatch, raw_factory):
     assert raw.n_times == 100
     assert metadata.acq_start_sample == 50
     assert metadata.acq_end_sample == 150
+    assert read_preload_values == [False]
 
 
 def test_auto_loader_invalid_window_raises(monkeypatch, raw_factory):

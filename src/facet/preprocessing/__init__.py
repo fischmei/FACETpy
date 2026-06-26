@@ -13,7 +13,16 @@ from .diagnostics import AnalyzeDataReport, CheckDataReport
 from .filtering import BandPassFilter, Filter, HighPassFilter, LowPassFilter, NotchFilter
 from .prefilter import MATLABPreFilter
 from .resampling import DownSample, Resample, UpSample
-from .transforms import ChannelStandardizer, Crop, DropChannels, MagicErasor, PickChannels, PrintMetric, RawTransform
+from .transforms import (
+    ChannelStandardizer,
+    Crop,
+    DropChannels,
+    DropChannelsMatching,
+    MagicErasor,
+    PickChannels,
+    PrintMetric,
+    RawTransform,
+)
 from .trigger_detection import (
     MissingTriggerCompleter,
     MissingTriggerDetector,
@@ -55,6 +64,7 @@ __all__ = [
     "RawTransform",
     "PickChannels",
     "DropChannels",
+    "DropChannelsMatching",
     "ChannelStandardizer",
     "PrintMetric",
     # MATLAB parity tools
