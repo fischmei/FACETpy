@@ -378,6 +378,9 @@ class BIDSExporter(Processor):
         Task name.
     session : str, optional
         Session identifier (without the ``ses-`` prefix).
+    run : str, optional
+        Run identifier used when exporting multiple segments for the same
+        subject/task.
     event_id : dict, optional
         Mapping of event description strings to integer event codes.
     overwrite : bool, optional
@@ -399,6 +402,7 @@ class BIDSExporter(Processor):
         subject: str,
         task: str,
         session: str | None = None,
+        run: str | None = None,
         event_id: dict | None = None,
         overwrite: bool = True,
     ) -> None:
@@ -406,6 +410,7 @@ class BIDSExporter(Processor):
         self.subject = subject
         self.task = task
         self.session = session
+        self.run = run
         self.event_id = event_id
         self.overwrite = overwrite
         super().__init__()
@@ -416,9 +421,10 @@ class BIDSExporter(Processor):
 
         # --- LOG ---
         logger.info(
-            "Exporting to BIDS: subject={}, task={}",
+            "Exporting to BIDS: subject={}, task={}, run={}",
             self.subject,
             self.task,
+            self.run,
         )
 
         # --- COMPUTE ---
@@ -428,6 +434,7 @@ class BIDSExporter(Processor):
             subject=self.subject,
             session=self.session,
             task=self.task,
+            run=self.run,
             root=self.root,
         )
 
