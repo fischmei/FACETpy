@@ -131,6 +131,7 @@ class TriggerDetector(Processor):
         logger.debug("Event types: {}", events_obj[1])
         annotation_events = list(mne.events_from_annotations(raw, regexp=self.regex, verbose=False)[0])
         if len(annotation_events) > 0:
+            logger.info("Using annotations with {} detected trigger(s)", len(annotation_events))
             return annotation_events
 
         return self._find_discrete_channel_events(raw, pattern)
@@ -160,7 +161,11 @@ class TriggerDetector(Processor):
             else:
                 channel_matches = [event for event in events if pattern.search(str(event[2]))]
             if channel_matches:
-                logger.debug("Found {} matching STIM events in {}", len(channel_matches), channel_name)
+                logger.info(
+                    "Using STIM trigger channel '{}' with {} detected trigger(s)",
+                    channel_name,
+                    len(channel_matches),
+                )
                 matched_events.extend(channel_matches)
                 continue
 
@@ -319,7 +324,7 @@ class TriggerDetector(Processor):
     def _has_trigger_name_hint(channel_name: str) -> bool:
         """Return whether a channel name commonly denotes triggers."""
         normalized = channel_name.lower().replace(" ", "").replace("_", "")
-        hints = ("status", "stim", "trigger", "trig", "marker", "event", "ttl", "sync")
+        hints = ("status", "stim", "trigger", "trig", "marker", "event", "ttl", "sync", "trev")
         return any(hint in normalized for hint in hints)
 
     @staticmethod
