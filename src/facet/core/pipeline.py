@@ -1505,7 +1505,6 @@ class Pipeline:
         sfreq = float(raw.info["sfreq"])
         chunk_samples = max(1, int(math_module.ceil(n_times / n_chunks)))
         duration = chunk_samples / sfreq
-
         epochs = mne_module.make_fixed_length_epochs(
             raw,
             duration=duration,

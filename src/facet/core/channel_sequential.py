@@ -112,6 +112,12 @@ class ChannelSequentialExecutor:
         try:
             for k, ch_abs_idx in enumerate(data_idx):
                 ch_start = time.time()
+                logger.info(
+                    "Channel-sequential channel {}/{}: {}",
+                    k + 1,
+                    len(data_idx),
+                    data_ch_names[k],
+                )
                 console.channel_started(k, data_ch_names[k])
 
                 ch_ctx = self._create_channel_context(context, ch_abs_idx)
