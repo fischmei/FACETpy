@@ -1068,9 +1068,10 @@ class Pipeline:
         keep_raw: bool = False,
         chunk_by_trigger_sections: bool | None = None,
         trigger_section_padding_seconds: float = 10.0,
-        trigger_section_min_triggers: int = 16,
+        trigger_section_min_triggers: int = 30,
         trigger_section_gap_seconds: float | None = None,
-        trigger_section_max_sections: int = 2,
+        # trigger_section_max_sections: int = 2,
+        trigger_section_max_sections: int | None = None,
     ) -> ChunkedPipelineResult:
         """Run a processing pipeline over bounded chunks of one input file.
 
@@ -1162,7 +1163,9 @@ class Pipeline:
             raise ValueError("trigger_section_min_triggers must be >= 1")
         if trigger_section_gap_seconds is not None and trigger_section_gap_seconds <= 0:
             raise ValueError("trigger_section_gap_seconds must be positive when provided")
-        if trigger_section_max_sections < 1:
+        # if trigger_section_max_sections < 1:
+        #     raise ValueError("trigger_section_max_sections must be >= 1")
+        if ( trigger_section_max_sections is not None and trigger_section_max_sections < 1):
             raise ValueError("trigger_section_max_sections must be >= 1")
 
         exporter_types = tuple(_EXTENSION_EXPORTERS.values()) + (_Exporter,)
@@ -1660,14 +1663,30 @@ class Pipeline:
             )
             valid_sections = [trigger_samples]
 
-        if len(valid_sections) > max_sections:
+        # if len(valid_sections) > max_sections:
+        #     logger.warning(
+        #         "Detected {} trigger sections; keeping the {} largest section(s)",
+        #         len(valid_sections),
+        #         max_sections,
+        #     )
+        #     valid_sections = sorted(valid_sections, key=lambda section: section.size, reverse=True)[:max_sections]
+        #     valid_sections = sorted(valid_sections, key=lambda section: int(section[0]))
+
+        if max_sections is not None and len(valid_sections) > max_sections:
             logger.warning(
                 "Detected {} trigger sections; keeping the {} largest section(s)",
                 len(valid_sections),
                 max_sections,
             )
-            valid_sections = sorted(valid_sections, key=lambda section: section.size, reverse=True)[:max_sections]
-            valid_sections = sorted(valid_sections, key=lambda section: int(section[0]))
+            valid_sections = sorted(
+                valid_sections,
+                key=lambda section: section.size,
+                reverse=True,
+            )[:max_sections]
+            valid_sections = sorted(
+                valid_sections,
+                key=lambda section: int(section[0]),
+            )
 
         return valid_sections
 
