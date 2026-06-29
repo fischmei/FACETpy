@@ -136,8 +136,8 @@ def _apply_sample_window(
 
     if start > 0 or stop < n_times:
         sfreq = raw.info["sfreq"]
-        tmin = start / sfreq if start > 0 else None
-        tmax = (stop - 1) / sfreq if stop < n_times else None
+        tmin = start / sfreq
+        tmax = (stop - 1) / sfreq
         raw.crop(tmin=tmin, tmax=tmax, verbose=False)
 
     return raw, start, stop
@@ -183,6 +183,7 @@ def _build_context_from_raw(
     stop_sample: int | None,
     artifact_to_trigger_offset: float,
     upsampling_factor: int,
+    preload_after_crop: bool = False,
     extra_custom: dict[str, Any] | None = None,
 ) -> ProcessingContext:
     """Post-read pipeline shared by all loaders.
@@ -204,6 +205,8 @@ def _build_context_from_raw(
         Offset in seconds stored in metadata.
     upsampling_factor : int
         Upsampling factor stored in metadata.
+    preload_after_crop : bool, optional
+        If ``True``, load signal data only after applying the sample window.
     extra_custom : dict, optional
         Additional entries for ``metadata.custom``.
 
@@ -228,6 +231,10 @@ def _build_context_from_raw(
             raw.n_times,
             full_n_times,
         )
+
+    if preload_after_crop and not raw.preload:
+        logger.debug("Preloading data after sample-window crop")
+        raw.load_data(verbose=False)
 
     acq_start = start_idx if start_sample is not None else None
     acq_end = stop_idx if stop_sample is not None else None
@@ -323,6 +330,7 @@ class Loader(Processor):
         # --- EXTRACT ---
         resolved = Path(self.path)
         reader_fn, format_name = _detect_format(resolved)
+        has_sample_window = self.start_sample is not None or self.stop_sample is not None
 
         # --- LOG ---
         logger.info("Loading {} file: {}", format_name, self.path)
@@ -332,7 +340,7 @@ class Loader(Processor):
             _ensure_mff_runtime_dependencies()
 
         with suppress_stdout():
-            raw = reader_fn(str(resolved), preload=self.preload, verbose=False)
+            raw = reader_fn(str(resolved), preload=self.preload and not has_sample_window, verbose=False)
 
         # --- RETURN ---
         return _build_context_from_raw(
@@ -342,6 +350,7 @@ class Loader(Processor):
             self.stop_sample,
             self.artifact_to_trigger_offset,
             self.upsampling_factor,
+            preload_after_crop=self.preload and has_sample_window,
             extra_custom={"source_format": format_name},
         )
 
@@ -443,7 +452,8 @@ class BIDSLoader(Processor):
         with suppress_stdout():
             raw = read_raw_bids(bids_path, verbose=False)
 
-        if self.preload:
+        has_sample_window = self.start_sample is not None or self.stop_sample is not None
+        if self.preload and not has_sample_window:
             raw.load_data()
 
         # --- RETURN ---
@@ -454,5 +464,6 @@ class BIDSLoader(Processor):
             self.stop_sample,
             self.artifact_to_trigger_offset,
             self.upsampling_factor,
+            preload_after_crop=self.preload and has_sample_window,
             extra_custom={"bids_path": bids_path},
         )

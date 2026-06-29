@@ -10,7 +10,15 @@ Date: 2025-01-12
 from .channel_sequential import ChannelSequentialExecutor
 from .context import ProcessingContext, ProcessingMetadata, ProcessingStep
 from .parallel import ParallelExecutor
-from .pipeline import BatchResult, Pipeline, PipelineBuilder, PipelineError, PipelineResult
+from .pipeline import (
+    BatchResult,
+    ChunkedPipelineResult,
+    ChunkSpec,
+    Pipeline,
+    PipelineBuilder,
+    PipelineError,
+    PipelineResult,
+)
 from .processor import (
     ConditionalProcessor,
     LambdaProcessor,
@@ -41,6 +49,8 @@ __all__ = [
     "Pipeline",
     "PipelineBuilder",
     "PipelineResult",
+    "ChunkSpec",
+    "ChunkedPipelineResult",
     "PipelineError",
     "BatchResult",
     # Registry
