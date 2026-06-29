@@ -76,6 +76,8 @@ module-root = "src"
 
 [project.scripts]
 build-fastranc = "facet.build:compile_fastranc"
+facetpy-run = "facet.cli:main"
+facetpy-to-bids = "facet.cli:bids_main"
 
 [tool.ruff]
 target-version = "py311"
