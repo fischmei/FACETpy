@@ -6,6 +6,7 @@ that don't fit neatly into filtering, resampling, or trigger handling.
 """
 
 import contextlib
+import re
 from collections.abc import Callable
 from typing import Any
 
@@ -1067,6 +1068,60 @@ class DropChannels(Processor):
         if to_drop:
             logger.info("Dropping channels: {}", to_drop)
             raw.drop_channels(to_drop)
+
+        # --- RETURN ---
+        return context.with_raw(raw)
+
+
+@register_processor
+class DropChannelsMatching(Processor):
+    """Remove channels whose names match a regular expression.
+
+    This is useful for vendor-specific numbered channels, for example EGI
+    ``E1`` through ``E128`` channels, while keeping auxiliary channels such as
+    trigger, ECG, or respiration channels.
+
+    Parameters
+    ----------
+    regex : str
+        Regular expression used to select channel names for removal.
+    fullmatch : bool, optional
+        If ``True`` (default), the whole channel name must match ``regex``.
+        If ``False``, any substring match is enough.
+    """
+
+    name = "drop_channels_matching"
+    description = "Remove channels matching a regular expression"
+    version = "1.0.0"
+
+    requires_triggers = False
+    requires_raw = True
+    modifies_raw = True
+    parallel_safe = True
+    chunk_probe_safe = True
+
+    def __init__(self, regex: str, fullmatch: bool = True):
+        self.regex = regex
+        self.fullmatch = fullmatch
+        self._pattern = re.compile(regex)
+        super().__init__()
+
+    def process(self, context: ProcessingContext) -> ProcessingContext:
+        # --- EXTRACT ---
+        raw = context.get_raw().copy()
+
+        # --- COMPUTE ---
+        if self.fullmatch:
+            to_drop = [ch for ch in raw.ch_names if self._pattern.fullmatch(ch)]
+        else:
+            to_drop = [ch for ch in raw.ch_names if self._pattern.search(ch)]
+
+        if not to_drop:
+            logger.info("No channels matched regex: {}", self.regex)
+            return context.with_raw(raw)
+
+        logger.info("Dropping {} channel(s) matching {}: {}", len(to_drop), self.regex, to_drop)
+        raw.drop_channels(to_drop)
 
         # --- RETURN ---
         return context.with_raw(raw)
