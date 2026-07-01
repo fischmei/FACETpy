@@ -18,6 +18,8 @@ from facet.logging_config import suppress_stdout
 from .context import ProcessingContext
 from .processor import Processor
 
+MERGED_LIST_METADATA_KEYS = ("artifact_template_matrices",)
+
 
 class ChannelSequentialExecutor:
     """
@@ -122,16 +124,24 @@ class ChannelSequentialExecutor:
 
                 ch_ctx = self._create_channel_context(context, ch_abs_idx)
                 if k == 0:
-                    metadata_states = [ch_ctx.metadata.copy()]
+                    metadata_states = [self._metadata_for_replay(ch_ctx.metadata)]
                 for pi, proc in enumerate(processors):
                     if k > 0 and pi < len(metadata_states):
                         ch_ctx = ch_ctx.with_metadata(metadata_states[pi].copy())
+                    before_counts = self._custom_list_lengths(ch_ctx, MERGED_LIST_METADATA_KEYS)
                     skipped = proc.run_once and proc.name in _run_once_executed
                     console.channel_processor_started(k, pi)
                     proc_start = time.time()
                     ch_ctx = self._run_proc(proc, ch_ctx, _run_once_executed)
+                    if k > 0 and saved_metadata is not None:
+                        self._merge_new_custom_list_items(
+                            target_metadata=saved_metadata,
+                            before_counts=before_counts,
+                            source_context=ch_ctx,
+                            keys=MERGED_LIST_METADATA_KEYS,
+                        )
                     if k == 0:
-                        metadata_states.append(ch_ctx.metadata.copy())
+                        metadata_states.append(self._metadata_for_replay(ch_ctx.metadata))
                     console.channel_processor_completed(
                         k,
                         pi,
@@ -144,7 +154,7 @@ class ChannelSequentialExecutor:
                 if k == 0:
                     n_times_out = ch_data.shape[1]
                     new_sfreq = ch_ctx.get_raw().info["sfreq"]
-                    saved_metadata = metadata_states[-1].copy()
+                    saved_metadata = ch_ctx.metadata.copy()
                     merged_data = np.zeros((n_ch, n_times_out), dtype=ch_data.dtype)
 
                     handle_noise = ch_ctx.has_estimated_noise()
@@ -217,6 +227,42 @@ class ChannelSequentialExecutor:
         if proc.run_once:
             run_once_executed.add(proc.name)
         return result
+
+    @staticmethod
+    def _custom_list_lengths(context: ProcessingContext, keys: tuple[str, ...]) -> dict[str, int]:
+        """Return lengths for mergeable custom-metadata list keys."""
+        lengths: dict[str, int] = {}
+        for key in keys:
+            value = context.metadata.custom.get(key)
+            lengths[key] = len(value) if isinstance(value, list) else 0
+        return lengths
+
+    @staticmethod
+    def _merge_new_custom_list_items(
+        target_metadata,
+        before_counts: dict[str, int],
+        source_context: ProcessingContext,
+        keys: tuple[str, ...],
+    ) -> None:
+        """Merge list entries produced by one channel before metadata resets."""
+        for key in keys:
+            value = source_context.metadata.custom.get(key)
+            if not isinstance(value, list):
+                continue
+
+            start = before_counts.get(key, 0)
+            if len(value) <= start:
+                continue
+
+            target_metadata.custom.setdefault(key, []).extend(value[start:])
+
+    @staticmethod
+    def _metadata_for_replay(metadata):
+        """Copy metadata used for later channels without bulky reports."""
+        replay = metadata.copy()
+        for key in MERGED_LIST_METADATA_KEYS:
+            replay.custom.pop(key, None)
+        return replay
 
     @staticmethod
     def _classify_channels(raw: mne.io.Raw):

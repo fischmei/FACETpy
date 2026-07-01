@@ -14,6 +14,12 @@ from ..core import ProcessingContext, Processor, ProcessorValidationError, regis
 from ..helpers.crosscorr import crosscorrelation
 from ..helpers.utils import split_vector
 
+FULL_MATRIX_MAX_CELLS = 4096
+SPARSE_MATRIX_MAX_NONZERO = 200_000
+SPARSE_MATRIX_PREVIEW_ROWS = 50
+ARTIFACT_TEMPLATE_PREVIEW_ROWS = 3
+ARTIFACT_TEMPLATE_PREVIEW_COLUMNS = 12
+
 
 @register_processor
 class AASCorrection(Processor):
@@ -180,6 +186,18 @@ class AASCorrection(Processor):
             logger.debug("Triggers realigned after AAS averaging")
             new_ctx = new_ctx.with_triggers(aligned_triggers)
 
+        new_ctx = self._with_artifact_template_report(
+            context=new_ctx,
+            raw=raw,
+            averaging_matrices=averaging_matrices,
+            artifacts_per_channel=artifacts_per_channel,
+            triggers=triggers,
+            aligned_triggers=aligned_triggers,
+            artifact_length=artifact_length,
+            artifact_offset=artifact_offset,
+            sfreq=sfreq,
+        )
+
         # --- RETURN ---
         logger.info("AAS correction complete: {} artifacts, {} channels", len(triggers), len(eeg_channels))
         return new_ctx
@@ -187,6 +205,164 @@ class AASCorrection(Processor):
     # -------------------------------------------------------------------------
     # Private Helpers
     # -------------------------------------------------------------------------
+
+    def _with_artifact_template_report(
+        self,
+        context: ProcessingContext,
+        raw: mne.io.Raw,
+        averaging_matrices: dict[int, np.ndarray],
+        artifacts_per_channel: list[np.ndarray],
+        triggers: np.ndarray,
+        aligned_triggers: np.ndarray,
+        artifact_length: int,
+        artifact_offset: float,
+        sfreq: float,
+    ) -> ProcessingContext:
+        """Attach a JSON-friendly report of the template matrix calculation."""
+        metadata = context.metadata.copy()
+        reports = metadata.custom.setdefault("artifact_template_matrices", [])
+        reports.append(
+            self._build_artifact_template_report(
+                raw=raw,
+                averaging_matrices=averaging_matrices,
+                artifacts_per_channel=artifacts_per_channel,
+                triggers=triggers,
+                aligned_triggers=aligned_triggers,
+                artifact_length=artifact_length,
+                artifact_offset=artifact_offset,
+                sfreq=sfreq,
+            )
+        )
+        return context.with_metadata(metadata)
+
+    def _build_artifact_template_report(
+        self,
+        raw: mne.io.Raw,
+        averaging_matrices: dict[int, np.ndarray],
+        artifacts_per_channel: list[np.ndarray],
+        triggers: np.ndarray,
+        aligned_triggers: np.ndarray,
+        artifact_length: int,
+        artifact_offset: float,
+        sfreq: float,
+    ) -> dict:
+        """Build a compact representation of ``N = A @ D`` for this correction."""
+        channels = []
+        for channel_list_index, (ch_idx, matrix) in enumerate(averaging_matrices.items()):
+            artifacts = artifacts_per_channel[channel_list_index]
+            channels.append(
+                {
+                    "channel_index": int(ch_idx),
+                    "channel_name": raw.ch_names[ch_idx],
+                    "data_matrix_D": {
+                        "shape": [int(matrix.shape[0]), int(artifact_length)],
+                        "description": "Rows are artifact epochs; columns are samples within each epoch.",
+                    },
+                    "averaging_matrix_A": self._serialize_averaging_matrix(matrix),
+                    "artifact_template_matrix_N": self._serialize_artifact_template_matrix(artifacts),
+                }
+            )
+
+        return {
+            "processor_name": self.name,
+            "processor_type": self.__class__.__name__,
+            "description": self.description,
+            "matrix_equation": {
+                "equation": "N = A @ D",
+                "D": "Artifact epoch data matrix with shape (n_epochs, artifact_length_samples).",
+                "A": "Averaging matrix; each row defines which epochs are averaged for one target epoch.",
+                "N": "Estimated artifact template matrix subtracted from the EEG.",
+            },
+            "parameters": self._get_parameters(),
+            "num_triggers": int(len(triggers)),
+            "num_aligned_triggers": int(len(aligned_triggers)),
+            "artifact_length_samples": int(artifact_length),
+            "artifact_offset_seconds": float(artifact_offset),
+            "sampling_rate_hz": float(sfreq),
+            "channels": channels,
+        }
+
+    def _serialize_averaging_matrix(self, matrix: np.ndarray) -> dict:
+        """Return a dense or sparse JSON-friendly representation of ``A``."""
+        matrix = np.asarray(matrix, dtype=float)
+        n_rows, n_cols = matrix.shape
+        nonzero_per_row = np.count_nonzero(matrix, axis=1)
+        row_sums = np.sum(matrix, axis=1) if n_rows else np.array([], dtype=float)
+        total_cells = int(matrix.size)
+        total_nonzero = int(np.count_nonzero(matrix))
+
+        payload = {
+            "shape": [int(n_rows), int(n_cols)],
+            "nonzero_weights": total_nonzero,
+            "density": float(total_nonzero / total_cells) if total_cells else 0.0,
+            "row_nonzero_count": {
+                "min": int(np.min(nonzero_per_row)) if nonzero_per_row.size else 0,
+                "mean": float(np.mean(nonzero_per_row)) if nonzero_per_row.size else 0.0,
+                "max": int(np.max(nonzero_per_row)) if nonzero_per_row.size else 0,
+            },
+            "row_sum": {
+                "min": float(np.min(row_sums)) if row_sums.size else 0.0,
+                "mean": float(np.mean(row_sums)) if row_sums.size else 0.0,
+                "max": float(np.max(row_sums)) if row_sums.size else 0.0,
+            },
+        }
+
+        if total_cells <= FULL_MATRIX_MAX_CELLS:
+            payload.update(
+                {
+                    "storage": "dense",
+                    "truncated": False,
+                    "matrix": matrix.tolist(),
+                }
+            )
+            return payload
+
+        include_all_sparse = total_nonzero <= SPARSE_MATRIX_MAX_NONZERO
+        max_rows = n_rows if include_all_sparse else min(n_rows, SPARSE_MATRIX_PREVIEW_ROWS)
+        payload.update(
+            {
+                "storage": "sparse_rows",
+                "truncated": not include_all_sparse,
+                "rows": self._sparse_rows(matrix, max_rows=max_rows),
+            }
+        )
+        if not include_all_sparse:
+            payload["note"] = (
+                "Sparse row output was truncated to keep the JSON report bounded. "
+                "Summary statistics above still describe the full matrix."
+            )
+        return payload
+
+    @staticmethod
+    def _sparse_rows(matrix: np.ndarray, max_rows: int) -> list[dict]:
+        """Serialize non-zero entries row by row."""
+        rows = []
+        for row_idx in range(max_rows):
+            columns = np.flatnonzero(matrix[row_idx])
+            rows.append(
+                {
+                    "row": int(row_idx),
+                    "columns": columns.astype(int).tolist(),
+                    "weights": matrix[row_idx, columns].astype(float).tolist(),
+                }
+            )
+        return rows
+
+    @staticmethod
+    def _serialize_artifact_template_matrix(artifacts: np.ndarray) -> dict:
+        """Summarize ``N`` and include a small top-left preview."""
+        artifacts = np.asarray(artifacts, dtype=float)
+        preview_rows = min(int(artifacts.shape[0]), ARTIFACT_TEMPLATE_PREVIEW_ROWS) if artifacts.ndim == 2 else 0
+        preview_cols = min(int(artifacts.shape[1]), ARTIFACT_TEMPLATE_PREVIEW_COLUMNS) if artifacts.ndim == 2 else 0
+        preview = artifacts[:preview_rows, :preview_cols].tolist() if artifacts.ndim == 2 else []
+
+        return {
+            "shape": [int(dim) for dim in artifacts.shape],
+            "preview_rows": preview_rows,
+            "preview_columns": preview_cols,
+            "preview": preview,
+            "note": "Preview only; full artifact templates are represented in the corrected EEG/noise estimate.",
+        }
 
     def _compute_averaging_matrices(
         self,

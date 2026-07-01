@@ -2,6 +2,7 @@
 
 import argparse
 import json
+from types import SimpleNamespace
 
 import pytest
 
@@ -60,7 +61,12 @@ def test_process_command_batches_into_recording_folders(monkeypatch, tmp_path):
     calls = []
 
     def fake_run_chunked(self, **kwargs):
-        calls.append(kwargs)
+        calls.append(
+            {
+                "kwargs": kwargs,
+                "processor_names": [processor.name for processor in self.processors],
+            }
+        )
         return _DummyChunkedResult()
 
     monkeypatch.setattr(Pipeline, "run_chunked", fake_run_chunked)
@@ -77,12 +83,411 @@ def test_process_command_batches_into_recording_folders(monkeypatch, tmp_path):
     )
 
     assert status == 0
-    assert [call["input_path"] for call in calls] == [str(first.resolve()), str(second.resolve())]
-    assert [call["output_dir"] for call in calls] == [
+    assert [call["kwargs"]["input_path"] for call in calls] == [str(first.resolve()), str(second.resolve())]
+    assert [call["kwargs"]["output_dir"] for call in calls] == [
         str((tmp_path / "corrected" / "sub01").resolve()),
         str((tmp_path / "corrected" / "sub02").resolve()),
     ]
-    assert all(call["chunk_by_trigger_sections"] for call in calls)
+    assert all(call["kwargs"]["chunk_by_trigger_sections"] for call in calls)
+    assert all("drop_channels_matching" not in call["processor_names"] for call in calls)
+
+
+def test_process_command_can_opt_in_to_egi_channel_drop(monkeypatch, tmp_path):
+    """EGI channel dropping should remain available when explicitly requested."""
+    source = tmp_path / "sub-01.mff"
+    source.mkdir()
+
+    processor_names = []
+
+    def fake_run_chunked(self, **kwargs):
+        processor_names.append([processor.name for processor in self.processors])
+        return _DummyChunkedResult()
+
+    monkeypatch.setattr(Pipeline, "run_chunked", fake_run_chunked)
+
+    status = cli.main(
+        [
+            "process",
+            "--input",
+            str(source),
+            "--output-dir",
+            str(tmp_path / "corrected"),
+            "--drop-egi-e-channels",
+        ]
+    )
+
+    assert status == 0
+    assert processor_names == [
+        [
+            "drop_channels_matching",
+            "trigger_detector",
+            "upsample",
+            "aas_correction",
+            "downsample",
+        ]
+    ]
+
+
+def test_process_command_builds_selected_correction_modes(monkeypatch, tmp_path):
+    """Correction and add-on modes should be ordered like the full examples."""
+    source = tmp_path / "sub-01.mff"
+    source.mkdir()
+
+    captured_processors = []
+
+    def fake_run_chunked(self, **kwargs):
+        captured_processors.append(self.processors)
+        return _DummyChunkedResult()
+
+    monkeypatch.setattr(Pipeline, "run_chunked", fake_run_chunked)
+
+    status = cli.main(
+        [
+            "process",
+            "--input",
+            str(source),
+            "--output-dir",
+            str(tmp_path / "corrected"),
+            "--correction-mode",
+            "farm",
+            "--farm-correlation-threshold",
+            "0.91",
+            "--mode",
+            "volume-artifact",
+            "--mode",
+            "pca",
+            "--pca-components",
+            "auto",
+            "--pca-hp-freq",
+            "0.5",
+            "--mode",
+            "anc",
+            "--no-anc-c-extension",
+        ]
+    )
+
+    assert status == 0
+    processors = captured_processors[0]
+    assert [processor.name for processor in processors] == [
+        "trigger_detector",
+        "upsample",
+        "volume_artifact_correction",
+        "farm_correction",
+        "pca_correction",
+        "downsample",
+        "anc_correction",
+    ]
+    assert processors[3].correlation_threshold == 0.91
+    assert processors[4].n_components == "auto"
+    assert processors[4].hp_freq == 0.5
+    assert processors[6].use_c_extension is False
+
+
+def test_process_command_writes_pipeline_and_matrix_reports(monkeypatch, tmp_path):
+    """Every processed input should receive pipeline and template-matrix JSON."""
+    source = tmp_path / "sub-01.mff"
+    source.mkdir()
+
+    chunk_output = tmp_path / "corrected" / "sub-01_chunk_001_of_001.edf"
+    matrix_report = {
+        "processor_name": "aas_correction",
+        "matrix_equation": {"equation": "N = A @ D"},
+        "channels": [
+            {
+                "channel_name": "Cz",
+                "averaging_matrix_A": {
+                    "shape": [2, 2],
+                    "storage": "dense",
+                    "matrix": [[0.5, 0.5], [0.5, 0.5]],
+                },
+            }
+        ],
+    }
+
+    class FakePipelineResult:
+        success = True
+        error = None
+        context = SimpleNamespace(
+            metadata=SimpleNamespace(custom={"artifact_template_matrices": [matrix_report]})
+        )
+
+    class FakeChunkedResult:
+        chunks = [
+            SimpleNamespace(
+                index=1,
+                total=1,
+                start_sample=0,
+                stop_sample=100,
+                duration_seconds=1.0,
+                output_path=chunk_output,
+            )
+        ]
+        source_path = str(source)
+        output_dir = str(tmp_path / "corrected")
+        execution_time = 1.25
+        manifest_path = tmp_path / "corrected" / "chunks_manifest.json"
+
+        def __iter__(self):
+            return iter([FakePipelineResult()])
+
+        def print_summary(self) -> None:
+            return None
+
+        def was_successful(self) -> bool:
+            return True
+
+    monkeypatch.setattr(Pipeline, "run_chunked", lambda self, **kwargs: FakeChunkedResult())
+
+    output_dir = tmp_path / "corrected"
+    status = cli.main(
+        [
+            "process",
+            "--input",
+            str(source),
+            "--output-dir",
+            str(output_dir),
+        ]
+    )
+
+    assert status == 0
+    pipeline_payload = json.loads((output_dir / "pipeline_description.json").read_text(encoding="utf-8"))
+    matrix_payload = json.loads((output_dir / "artifact_template_matrices.json").read_text(encoding="utf-8"))
+
+    assert pipeline_payload["correction_mode"] == "aas"
+    assert pipeline_payload["result"]["artifact_template_matrix_report"].endswith("artifact_template_matrices.json")
+    assert matrix_payload["description"].startswith("AAS-style corrections build artifact templates")
+    assert matrix_payload["reports"][0]["processor_name"] == "aas_correction"
+    assert matrix_payload["reports"][0]["chunk"]["index"] == 1
+
+
+def test_process_command_builds_standard_pattern(monkeypatch, tmp_path):
+    """The standard pattern should mirror the docs full correction flow."""
+    source = tmp_path / "sub-01.mff"
+    source.mkdir()
+
+    captured_processors = []
+
+    def fake_run_chunked(self, **kwargs):
+        captured_processors.append(self.processors)
+        return _DummyChunkedResult()
+
+    monkeypatch.setattr(Pipeline, "run_chunked", fake_run_chunked)
+
+    status = cli.main(
+        [
+            "process",
+            "--input",
+            str(source),
+            "--output-dir",
+            str(tmp_path / "corrected"),
+            "--pattern",
+            "standard",
+            "--no-anc-c-extension",
+        ]
+    )
+
+    assert status == 0
+    assert [processor.name for processor in captured_processors[0]] == [
+        "trigger_detector",
+        "cut_acquisition_window",
+        "highpass_filter",
+        "upsample",
+        "slice_aligner",
+        "subsample_aligner",
+        "aas_correction",
+        "pca_correction",
+        "downsample",
+        "paste_acquisition_window",
+        "lowpass_filter",
+        "anc_correction",
+    ]
+
+
+def test_process_command_builds_bcg_pattern_with_fixed_chunks(monkeypatch, tmp_path):
+    """BCG uses QRS triggers and fixed chunks because trigger probing is regex-based."""
+    source = tmp_path / "sub-01.mff"
+    source.mkdir()
+
+    calls = []
+
+    def fake_run_chunked(self, **kwargs):
+        calls.append(
+            {
+                "kwargs": kwargs,
+                "processor_names": [processor.name for processor in self.processors],
+            }
+        )
+        return _DummyChunkedResult()
+
+    monkeypatch.setattr(Pipeline, "run_chunked", fake_run_chunked)
+
+    status = cli.main(
+        [
+            "process",
+            "--input",
+            str(source),
+            "--output-dir",
+            str(tmp_path / "corrected"),
+            "--pattern",
+            "bcg",
+        ]
+    )
+
+    assert status == 0
+    assert calls[0]["kwargs"]["chunk_by_trigger_sections"] is False
+    assert calls[0]["processor_names"] == ["qrs_trigger_detector", "aas_correction"]
+
+
+def test_process_command_moosmann_requires_motion_file(tmp_path):
+    """Motion-informed mode should fail early without realignment parameters."""
+    source = tmp_path / "sub-01.mff"
+    source.mkdir()
+
+    with pytest.raises(ValueError, match="--motion-rp-file"):
+        cli.main(
+            [
+                "process",
+                "--input",
+                str(source),
+                "--output-dir",
+                str(tmp_path / "corrected"),
+                "--correction-mode",
+                "moosmann",
+            ]
+        )
+
+
+def test_modes_command_lists_cli_modes(capsys):
+    """The discovery command should explain correction and add-on modes."""
+    status = cli.main(["modes"])
+
+    captured = capsys.readouterr()
+    assert status == 0
+    assert "Correction modes replace the baseline AAS" in captured.out
+    assert "farm:" in captured.out
+    assert "pca:" in captured.out
+    assert "anc:" in captured.out
+
+
+def test_patterns_command_lists_cli_patterns(capsys):
+    """The pattern discovery command should keep modes and patterns separate."""
+    status = cli.main(["patterns"])
+
+    captured = capsys.readouterr()
+    assert status == 0
+    assert "Pipeline patterns" in captured.out
+    assert "quickstart:" in captured.out
+    assert "standard:" in captured.out
+    assert "batch:" in captured.out
+
+
+def test_default_command_preserves_root_help():
+    """Top-level help should expose discovery commands instead of process help."""
+    assert cli._with_default_command(["--help"]) == ["--help"]
+    assert cli._with_default_command(["-h"]) == ["-h"]
+    assert cli._with_default_command(["--input", "recording.edf"]) == ["process", "--input", "recording.edf"]
+
+
+def test_viewer_command_uses_raw_plotter(monkeypatch, tmp_path):
+    """Viewer CLI should delegate to FACETpy RawPlotter."""
+    context = object()
+    loader_calls = []
+    plotter_calls = []
+
+    class DummyLoader:
+        def __init__(self, **kwargs):
+            loader_calls.append(kwargs)
+
+        def execute(self, context_arg):
+            assert context_arg is None
+            return context
+
+    class DummyPlotter:
+        def __init__(self, **kwargs):
+            plotter_calls.append(kwargs)
+
+        def execute(self, context_arg):
+            assert context_arg is context
+            return context_arg
+
+    monkeypatch.setattr(cli, "Loader", DummyLoader)
+    monkeypatch.setattr(cli, "RawPlotter", DummyPlotter)
+
+    output_path = tmp_path / "plot.png"
+    status = cli.main(
+        [
+            "viewer",
+            "--input",
+            str(tmp_path / "recording.edf"),
+            "--output",
+            str(output_path),
+            "--channel",
+            "Cz",
+            "--show",
+            "--n-channels",
+            "30",
+            "--scalings",
+            "auto",
+        ]
+    )
+
+    assert status == 0
+    assert loader_calls[0]["preload"] is True
+    assert plotter_calls[0]["channel"] == "Cz"
+    assert plotter_calls[0]["save_path"] == str(output_path)
+    assert plotter_calls[0]["show"] is True
+    assert plotter_calls[0]["mne_kwargs"] == {"n_channels": 30, "scalings": "auto"}
+
+
+def test_analysis_command_writes_report_json(monkeypatch, tmp_path):
+    """Analysis CLI should delegate to report processors and write metadata."""
+    context = SimpleNamespace(metadata=SimpleNamespace(custom={}))
+
+    class DummyLoader:
+        def __init__(self, **kwargs):
+            self.kwargs = kwargs
+
+        def execute(self, context_arg):
+            assert context_arg is None
+            return context
+
+    class DummyProcessor:
+        def __init__(self, name, **kwargs):
+            self.name = name
+            self.kwargs = kwargs
+
+        def execute(self, context_arg):
+            context_arg.metadata.custom[self.name] = {"kwargs": self.kwargs}
+            return context_arg
+
+    monkeypatch.setattr(cli, "Loader", DummyLoader)
+    monkeypatch.setattr(cli, "AnalyzeDataReport", lambda: DummyProcessor("analyze_data_report"))
+    monkeypatch.setattr(
+        cli,
+        "CheckDataReport",
+        lambda **kwargs: DummyProcessor("check_data_report", **kwargs),
+    )
+
+    report_path = tmp_path / "analysis.json"
+    status = cli.main(
+        [
+            "analysis",
+            "--input",
+            str(tmp_path / "recording.edf"),
+            "--require-triggers",
+            "--strict",
+            "--output-json",
+            str(report_path),
+        ]
+    )
+
+    assert status == 0
+    payload = json.loads(report_path.read_text(encoding="utf-8"))
+    assert "analyze_data_report" in payload
+    assert payload["check_data_report"]["kwargs"] == {
+        "require_triggers": True,
+        "strict": True,
+    }
 
 
 def test_process_command_continues_after_failed_input(monkeypatch, tmp_path):

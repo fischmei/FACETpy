@@ -48,7 +48,16 @@ def moving_average(n_fmri, window_size):
 
 def calc_weighted_matrix_by_realignment_parameters_file(rp_file, n_fmri, k, threshold=5):
     # Lade Realignment Parameter Datei
-    rp_data = pd.read_csv(rp_file, sep="\t", header=None, skiprows=1, decimal=".")
+    # rp_data = pd.read_csv(rp_file, sep="\t", header=None, skiprows=1, decimal=".")
+    rp_data = pd.read_csv(
+        rp_file,
+        sep=r"\s+",
+        header=None,
+        comment="#",
+        engine="python",
+    )
+
+    rp_data = rp_data.apply(pd.to_numeric, errors="raise")
 
     motiondata = single_motion(rp_data, threshold, 0)
     motiondata["both_not_normed"] = np.concatenate(
