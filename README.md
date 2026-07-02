@@ -167,6 +167,7 @@ Optional contributor extras:
 uv sync --extra deeplearning     # TensorFlow-based models
 uv sync --extra notebooks        # Jupyter notebook support
 uv sync --extra gui              # PyQt6 GUI components
+uv sync --extra gui-all          # all supported Qt bindings
 uv sync --extra docs             # Sphinx documentation toolchain
 uv sync --all-extras             # everything above
 ```
