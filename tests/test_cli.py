@@ -7,7 +7,7 @@ from types import SimpleNamespace
 import pytest
 
 from facet import cli
-from facet.core import Pipeline
+from facet.core import Pipeline, ProcessorValidationError
 
 pytestmark = pytest.mark.unit
 
@@ -207,9 +207,7 @@ def test_process_command_writes_pipeline_and_matrix_reports(monkeypatch, tmp_pat
     class FakePipelineResult:
         success = True
         error = None
-        context = SimpleNamespace(
-            metadata=SimpleNamespace(custom={"artifact_template_matrices": [matrix_report]})
-        )
+        context = SimpleNamespace(metadata=SimpleNamespace(custom={"artifact_template_matrices": [matrix_report]}))
 
     class FakeChunkedResult:
         chunks = [
@@ -488,6 +486,120 @@ def test_analysis_command_writes_report_json(monkeypatch, tmp_path):
         "require_triggers": True,
         "strict": True,
     }
+
+
+def test_analysis_command_lists_metrics_without_input(capsys):
+    """Metric listing should not require loading a recording."""
+    status = cli.main(["analysis", "--list-metrics"])
+
+    output = capsys.readouterr().out
+    assert status == 0
+    assert "Available analysis metrics:" in output
+    assert "legacy-snr:" in output
+    assert "fft-niazy:" in output
+
+
+def test_analysis_command_selects_metrics_and_skips_inapplicable(monkeypatch, tmp_path):
+    """Selected metrics should continue when one metric cannot apply."""
+    context = SimpleNamespace(metadata=SimpleNamespace(custom={}))
+    calls = []
+
+    class DummyLoader:
+        def __init__(self, **kwargs):
+            self.kwargs = kwargs
+
+        def execute(self, context_arg):
+            assert context_arg is None
+            return context
+
+    class NoOpProcessor:
+        def execute(self, context_arg):
+            return context_arg
+
+    class DummyMetric:
+        def __init__(self, name, failure=None):
+            self.name = name
+            self.failure = failure
+
+        def execute(self, context_arg):
+            calls.append(self.name)
+            if self.failure is not None:
+                raise ProcessorValidationError(self.failure)
+            context_arg.metadata.custom.setdefault("metrics", {})[self.name] = True
+            return context_arg
+
+    monkeypatch.setattr(cli, "Loader", DummyLoader)
+    monkeypatch.setattr(cli, "AnalyzeDataReport", NoOpProcessor)
+    monkeypatch.setattr(cli, "CheckDataReport", lambda **kwargs: NoOpProcessor())
+    monkeypatch.setattr(cli, "RMSCalculator", lambda: DummyMetric("rms"))
+    monkeypatch.setattr(
+        cli,
+        "LegacySNRCalculator",
+        lambda: DummyMetric("legacy-snr", "Original raw data not available."),
+    )
+    monkeypatch.setattr(cli, "MetricsReport", lambda: DummyMetric("report"))
+
+    report_path = tmp_path / "analysis.json"
+    status = cli.main(
+        [
+            "analysis",
+            "--input",
+            str(tmp_path / "recording.edf"),
+            "--metric",
+            "rms",
+            "--metric",
+            "legacy-snr",
+            "--metric",
+            "report",
+            "--output-json",
+            str(report_path),
+        ]
+    )
+
+    payload = json.loads(report_path.read_text(encoding="utf-8"))
+    assert status == 0
+    assert calls == ["rms", "legacy-snr", "report"]
+    assert payload["metrics"] == {"rms": True, "report": True}
+    assert payload["skipped_metrics"] == ["legacy-snr"]
+    assert payload["skipped_metric_reasons"]["legacy-snr"] == "Original raw data not available."
+
+
+def test_analysis_command_can_fail_on_inapplicable_metric(monkeypatch, tmp_path):
+    """Strict metric mode should preserve the original validation failure."""
+    context = SimpleNamespace(metadata=SimpleNamespace(custom={}))
+
+    class DummyLoader:
+        def __init__(self, **kwargs):
+            self.kwargs = kwargs
+
+        def execute(self, context_arg):
+            assert context_arg is None
+            return context
+
+    class NoOpProcessor:
+        def execute(self, context_arg):
+            return context_arg
+
+    class InvalidMetric:
+        def execute(self, context_arg):
+            raise ProcessorValidationError("Original raw data not available.")
+
+    monkeypatch.setattr(cli, "Loader", DummyLoader)
+    monkeypatch.setattr(cli, "AnalyzeDataReport", NoOpProcessor)
+    monkeypatch.setattr(cli, "CheckDataReport", lambda **kwargs: NoOpProcessor())
+    monkeypatch.setattr(cli, "LegacySNRCalculator", InvalidMetric)
+
+    with pytest.raises(ProcessorValidationError, match="Original raw data not available"):
+        cli.main(
+            [
+                "analysis",
+                "--input",
+                str(tmp_path / "recording.edf"),
+                "--metric",
+                "legacy-snr",
+                "--no-skip-inapplicable-metrics",
+            ]
+        )
 
 
 def test_process_command_continues_after_failed_input(monkeypatch, tmp_path):
