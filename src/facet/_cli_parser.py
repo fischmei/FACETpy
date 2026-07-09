@@ -96,7 +96,7 @@ def _build_parser(
         "--bcg-window-size",
         type=int,
         default=20,
-        help="AAS window size used by --pattern=bcg.",
+        help="AAS window size used by --mode=bcg and --pattern=bcg.",
     )
     process.add_argument(
         "--correction-mode",
@@ -109,7 +109,7 @@ def _build_parser(
         action="append",
         choices=tuple(ADD_ON_MODE_DESCRIPTIONS),
         default=None,
-        help="Optional add-on correction mode. Repeat to combine modes, for example --mode pca --mode anc.",
+        help="Optional add-on correction mode. Repeat to combine modes, for example --mode pca --mode anc --mode bcg.",
     )
     process.add_argument(
         "--aas-correlation-threshold",

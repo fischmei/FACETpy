@@ -162,6 +162,8 @@ def test_process_command_builds_selected_correction_modes(monkeypatch, tmp_path)
             "0.5",
             "--mode",
             "anc",
+            "--mode",
+            "bcg",
             "--no-anc-c-extension",
         ]
     )
@@ -176,6 +178,8 @@ def test_process_command_builds_selected_correction_modes(monkeypatch, tmp_path)
         "pca_correction",
         "downsample",
         "anc_correction",
+        "qrs_trigger_detector",
+        "aas_correction",
     ]
     assert processors[3].correlation_threshold == 0.91
     assert processors[4].n_components == "auto"
@@ -244,6 +248,8 @@ def test_process_command_writes_pipeline_and_matrix_reports(monkeypatch, tmp_pat
             str(source),
             "--output-dir",
             str(output_dir),
+            "--mode",
+            "bcg",
         ]
     )
 
@@ -252,6 +258,8 @@ def test_process_command_writes_pipeline_and_matrix_reports(monkeypatch, tmp_pat
     matrix_payload = json.loads((output_dir / "artifact_template_matrices.json").read_text(encoding="utf-8"))
 
     assert pipeline_payload["correction_mode"] == "aas"
+    assert pipeline_payload["bcg_enabled"] is True
+    assert pipeline_payload["bcg_selected_as_mode"] is True
     assert pipeline_payload["result"]["artifact_template_matrix_report"].endswith("artifact_template_matrices.json")
     assert matrix_payload["description"].startswith("AAS-style corrections build artifact templates")
     assert matrix_payload["reports"][0]["processor_name"] == "aas_correction"
@@ -298,6 +306,81 @@ def test_process_command_builds_standard_pattern(monkeypatch, tmp_path):
         "paste_acquisition_window",
         "lowpass_filter",
         "anc_correction",
+    ]
+
+
+def test_standard_pattern_can_add_bcg_mode(monkeypatch, tmp_path):
+    """--mode=bcg should extend the standard pattern defaults instead of replacing them."""
+    source = tmp_path / "sub-01.mff"
+    source.mkdir()
+
+    captured_processors = []
+
+    def fake_run_chunked(self, **kwargs):
+        captured_processors.append([processor.name for processor in self.processors])
+        return _DummyChunkedResult()
+
+    monkeypatch.setattr(Pipeline, "run_chunked", fake_run_chunked)
+
+    status = cli.main(
+        [
+            "process",
+            "--input",
+            str(source),
+            "--output-dir",
+            str(tmp_path / "corrected"),
+            "--pattern",
+            "standard",
+            "--mode",
+            "bcg",
+            "--no-anc-c-extension",
+        ]
+    )
+
+    assert status == 0
+    assert captured_processors[0][-4:] == [
+        "lowpass_filter",
+        "anc_correction",
+        "qrs_trigger_detector",
+        "aas_correction",
+    ]
+
+
+def test_process_command_can_add_bcg_mode(monkeypatch, tmp_path):
+    """--mode=bcg should append QRS-triggered BCG correction to quickstart."""
+    source = tmp_path / "sub-01.mff"
+    source.mkdir()
+
+    captured_processors = []
+
+    def fake_run_chunked(self, **kwargs):
+        captured_processors.append([processor.name for processor in self.processors])
+        return _DummyChunkedResult()
+
+    monkeypatch.setattr(Pipeline, "run_chunked", fake_run_chunked)
+
+    status = cli.main(
+        [
+            "process",
+            "--input",
+            str(source),
+            "--output-dir",
+            str(tmp_path / "corrected"),
+            "--mode",
+            "bcg",
+        ]
+    )
+
+    assert status == 0
+    assert captured_processors == [
+        [
+            "trigger_detector",
+            "upsample",
+            "aas_correction",
+            "downsample",
+            "qrs_trigger_detector",
+            "aas_correction",
+        ]
     ]
 
 
@@ -365,6 +448,7 @@ def test_modes_command_lists_cli_modes(capsys):
     assert "farm:" in captured.out
     assert "pca:" in captured.out
     assert "anc:" in captured.out
+    assert "bcg:" in captured.out
 
 
 def test_patterns_command_lists_cli_patterns(capsys):

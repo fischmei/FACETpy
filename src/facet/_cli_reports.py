@@ -137,6 +137,7 @@ def _write_pipeline_description(
     chunks = list(getattr(chunked_result, "chunks", []))
     results = _chunked_results(chunked_result)
     add_on_modes, selected_by_pattern = _selected_add_on_modes(args)
+    bcg_enabled = args.pattern == "bcg" or "bcg" in add_on_modes
     payload = {
         "source_path": str(input_path),
         "output_dir": str(target_dir),
@@ -145,6 +146,9 @@ def _write_pipeline_description(
         "correction_mode": args.correction_mode,
         "correction_mode_description": CORRECTION_MODE_DESCRIPTIONS.get(args.correction_mode),
         "correction_matrix_description": CORRECTION_MATRIX_DESCRIPTIONS.get(args.correction_mode),
+        "bcg_enabled": bool(bcg_enabled),
+        "bcg_selected_as_mode": "bcg" in add_on_modes,
+        "bcg_window_size": int(args.bcg_window_size),
         "add_on_modes": add_on_modes,
         "add_on_modes_selected_by_pattern": selected_by_pattern,
         "add_on_mode_descriptions": {mode: ADD_ON_MODE_DESCRIPTIONS[mode] for mode in add_on_modes},

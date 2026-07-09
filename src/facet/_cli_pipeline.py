@@ -55,6 +55,7 @@ ADD_ON_MODE_DESCRIPTIONS = {
     "volume-artifact": "Correct transition artifacts around slice-trigger volume gaps before template subtraction.",
     "pca": "Apply PCA residual cleanup after template subtraction.",
     "anc": "Apply adaptive noise cancellation after downsampling, using the accumulated noise estimate.",
+    "bcg": "Apply QRS-triggered BCG artifact correction after scanner-template correction.",
 }
 CORRECTION_MATRIX_DESCRIPTIONS = {
     "aas": "AAS builds A with correlation-selected epochs from sliding windows.",
@@ -65,8 +66,8 @@ CORRECTION_MATRIX_DESCRIPTIONS = {
     "moosmann": "Moosmann correction builds A from motion-informed realignment-parameter weights.",
 }
 PROCESS_PATTERN_DESCRIPTIONS = {
-    "quickstart": "Memory-light trigger-section chunks: trigger detection, upsample, correction, downsample.",
-    "standard": "Docs standard pipeline: cut, high-pass, align, correction, PCA, downsample, paste, low-pass, ANC.",
+    "quickstart": "Memory-light scanner correction. Add --mode bcg for QRS-triggered BCG cleanup.",
+    "standard": "Docs standard scanner correction with PCA and ANC add-ons by default. Add --mode bcg for BCG cleanup.",
     "bcg": "Ballistocardiogram pattern: QRS trigger detection plus AAS correction.",
 }
 PATTERN_DESCRIPTIONS = {
@@ -105,10 +106,10 @@ def _unique_modes(modes: Sequence[str] | None) -> list[str]:
 
 def _selected_add_on_modes(args: argparse.Namespace) -> tuple[list[str], bool]:
     """Return add-on modes and whether they were selected by a pattern."""
+    if args.pattern == "standard":
+        return _unique_modes(["pca", "anc", *(args.mode or [])]), True
     if args.mode is not None:
         return _unique_modes(args.mode), False
-    if args.pattern == "standard":
-        return ["pca", "anc"], True
     return [], False
 
 
@@ -205,6 +206,8 @@ def _build_mode_processors(args: argparse.Namespace) -> tuple[list, list, list]:
                     max_gain=args.anc_max_gain,
                 )
             )
+        elif mode == "bcg":
+            post_downsample.extend(_build_bcg_pattern(args))
         else:
             raise ValueError(f"Unsupported add-on mode: {mode}")
 

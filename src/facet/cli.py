@@ -143,7 +143,7 @@ def _run_modes(args: argparse.Namespace) -> int:
         "Add-on modes are layered around the selected correction mode:",
         *[f"  {name}: {description}" for name, description in ADD_ON_MODE_DESCRIPTIONS.items()],
         "",
-        "Example: facetpy-run process --input data.mff --output-dir output --correction-mode farm --mode pca --mode anc",
+        "Example: facetpy-run process --input data.mff --output-dir output --correction-mode farm --mode pca --mode anc --mode bcg",
     ]
     print("\n".join(lines))
     return 0

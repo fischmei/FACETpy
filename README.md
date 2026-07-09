@@ -237,7 +237,8 @@ facetpy-run analysis --list-metrics
 ### Processing EEG files
 
 `process` accepts single files, repeated files, path lists, or folders. It also
-understands MFF directories.
+understands MFF directories. The default processing flow is scanner/gradient
+correction; add `--mode bcg` when you also want QRS-triggered BCG cleanup.
 
 ```bash
 # One input
@@ -279,9 +280,9 @@ Patterns define the whole pipeline shape:
 
 | Pattern | Use when |
 |---|---|
-| `--pattern quickstart` | You want the default memory-light trigger-section workflow |
-| `--pattern standard` | You want the full docs-style workflow with cut/filter/align/correct/restore/filter stages |
-| `--pattern bcg` | You want QRS-triggered ballistocardiogram correction |
+| `--pattern quickstart` | You want the default memory-light scanner workflow; add `--mode bcg` for cardiac cleanup |
+| `--pattern standard` | You want the full docs-style scanner workflow with pattern-selected PCA and ANC; add `--mode bcg` for cardiac cleanup |
+| `--pattern bcg` | You want the specialized BCG-only path |
 
 Correction modes choose the main template-subtraction strategy:
 
@@ -301,7 +302,12 @@ more than once:
 --mode volume-artifact   # before template subtraction
 --mode pca               # after template subtraction
 --mode anc               # after downsampling
+--mode bcg               # QRS-triggered BCG cleanup after scanner correction
 ```
+
+BCG can also be run alone with `--pattern bcg`. Use that specialized path when
+you only want QRS trigger detection and BCG artifact subtraction, without the
+scanner/gradient correction stages.
 
 Examples:
 
@@ -317,6 +323,14 @@ facetpy-run process \
   --on-error continue \
   --overwrite
 
+# Scanner correction plus QRS-triggered BCG cleanup
+facetpy-run process \
+  --input raw.edf \
+  --output-dir output/scanner_bcg \
+  --pattern quickstart \
+  --mode bcg \
+  --overwrite
+
 # Motion-informed Moosmann weighting
 facetpy-run process \
   --input raw.edf \
@@ -327,7 +341,7 @@ facetpy-run process \
   --on-error continue \
   --overwrite
 
-# QRS-triggered BCG correction
+# QRS-triggered BCG-only correction
 facetpy-run process \
   --input raw.edf \
   --output-dir output/bcg \
@@ -376,7 +390,7 @@ JSON metadata:
 | File | Contents |
 |---|---|
 | `chunks_manifest.json` | Source path, chunk windows, output files, runtime, success/error per chunk |
-| `pipeline_description.json` | Pattern, correction mode, add-on modes, processor list, parameters, output paths |
+| `pipeline_description.json` | Pattern, correction mode, BCG mode status, add-on modes, processor list, parameters, output paths |
 | `artifact_template_matrices.json` | AAS-style `N = A @ D` reports: epoch matrix `D`, averaging matrix `A`, and artifact-template matrix `N` preview |
 
 If a recording fails and `--on-error continue` is used, FACETpy writes
