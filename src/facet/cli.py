@@ -137,7 +137,7 @@ def _run_modes(args: argparse.Namespace) -> int:
     del args
 
     lines = [
-        "Correction modes replace the baseline AAS template-subtraction step:",
+        "Correction modes select the Flex template-subtraction strategy:",
         *[f"  {name}: {description}" for name, description in CORRECTION_MODE_DESCRIPTIONS.items()],
         "",
         "Add-on modes are layered around the selected correction mode:",
@@ -340,8 +340,10 @@ def _run_process(args: argparse.Namespace) -> int:
                 output_extension=args.output_extension,
                 min_chunks=args.min_chunks,
                 max_chunks=args.max_chunks,
-                memory_budget_mb=args.memory_budget_mb,
+                max_memory_mb=args.max_memory_mb,
                 memory_fraction=args.memory_fraction,
+                disable_chunking=args.disable_chunking,
+                force_full_run=args.force_full_run,
                 overwrite=args.overwrite,
                 channel_sequential=args.channel_sequential,
                 on_error=args.on_error,

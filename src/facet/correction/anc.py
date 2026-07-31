@@ -139,8 +139,11 @@ class ANCCorrection(Processor):
                 progress.advance(1, message=status)
 
         # --- NOISE ---
-        new_ctx = context.with_raw(raw)
-        new_ctx.set_estimated_noise(noise_updated)
+        new_ctx = context.with_raw(
+            raw,
+            estimated_noise=noise_updated,
+            copy_estimated_noise=False,
+        )
 
         # --- BUILD RESULT + RETURN ---
         logger.info("ANC correction completed")
@@ -230,7 +233,10 @@ class ANCCorrection(Processor):
             "max_gain": self.max_gain,
             "used_c_extension": bool(self._fastranc_available),
         }
-        return ctx.with_metadata(new_metadata)
+        return ctx.with_metadata(
+            new_metadata,
+            copy_estimated_noise=False,
+        )
 
     def _anc_single_channel(
         self,

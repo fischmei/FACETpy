@@ -301,7 +301,10 @@ class ArtifactOffsetFinder(Processor):
         new_metadata.artifact_to_trigger_offset = chosen_offset
 
         # --- RETURN ---
-        return context.with_metadata(new_metadata)
+        return context.with_metadata(
+            new_metadata,
+            copy_estimated_noise=False,
+        )
 
     # -----------------------------------------------------------------
     # Private Helpers

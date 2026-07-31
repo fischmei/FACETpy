@@ -42,6 +42,9 @@ class PCACorrection(Processor):
         Pre-computed filter weights; overrides ``hp_freq`` when provided.
     exclude_channels : list, optional
         Channel indices to skip during PCA (default: empty list).
+    track_estimated_noise : bool, optional
+        Retain PCA residuals as a full-length noise estimate for downstream
+        ANC or inspection (default: True).
     """
 
     name = "pca_correction"
@@ -64,17 +67,23 @@ class PCACorrection(Processor):
         hp_freq: float | None = None,
         hp_filter_weights: np.ndarray | None = None,
         exclude_channels: list | None = None,
+        track_estimated_noise: bool = True,
     ) -> None:
         self.n_components = n_components
         self.hp_freq = hp_freq
         self.hp_filter_weights = hp_filter_weights
         self.exclude_channels = exclude_channels or []
+        self.track_estimated_noise = track_estimated_noise
         super().__init__()
 
     def validate(self, context: ProcessingContext) -> None:
         super().validate(context)
         if context.get_artifact_length() is None:
             raise ProcessorValidationError("Artifact length not set. Run TriggerDetector first.")
+        if not isinstance(self.track_estimated_noise, bool):
+            raise ProcessorValidationError(
+                f"track_estimated_noise must be a boolean, got {self.track_estimated_noise!r}"
+            )
 
     def process(self, context: ProcessingContext) -> ProcessingContext:
         # --- EXTRACT ---
@@ -94,7 +103,7 @@ class PCACorrection(Processor):
         hp_weights = self._resolve_hp_weights(raw.info["sfreq"])
         s_acq_start, s_acq_end = self._get_acquisition_window(context)
         # Direct _data access avoids a full array copy on large datasets
-        estimated_artifacts = np.zeros(raw._data.shape)
+        estimated_artifacts = np.zeros(raw._data.shape) if self.track_estimated_noise else None
 
         with processor_progress(
             total=len(eeg_channels) or None,
@@ -122,15 +131,32 @@ class PCACorrection(Processor):
                         hp_weights,
                     )
                     raw._data[ch_idx][s_acq_start:s_acq_end] -= residuals
-                    estimated_artifacts[ch_idx][s_acq_start:s_acq_end] += residuals
+                    if estimated_artifacts is not None:
+                        estimated_artifacts[ch_idx][s_acq_start:s_acq_end] += residuals
                     progress.advance(1, message=status_prefix)
                 except Exception as exc:
                     logger.error("PCA failed for channel {}: {}", ch_name, exc)
                     progress.advance(1, message=f"{status_prefix} (error)")
 
         # --- NOISE ---
-        new_ctx = context.with_raw(raw)
-        new_ctx.accumulate_noise(estimated_artifacts)
+        if estimated_artifacts is None:
+            new_ctx = context.with_raw(
+                raw,
+                estimated_noise=None,
+                copy_estimated_noise=False,
+            )
+        else:
+            previous_noise = context.get_estimated_noise()
+            if previous_noise is None:
+                accumulated_noise = estimated_artifacts
+            else:
+                accumulated_noise = previous_noise.copy()
+                accumulated_noise += estimated_artifacts
+            new_ctx = context.with_raw(
+                raw,
+                estimated_noise=accumulated_noise,
+                copy_estimated_noise=False,
+            )
 
         # --- RETURN ---
         logger.info("PCA correction completed")

@@ -20,6 +20,13 @@ from loguru import logger
 from facet.logging_config import suppress_stdout
 
 
+class _UnspecifiedEstimatedNoise:
+    """Sentinel type used when a context operation should preserve noise."""
+
+
+_UNSPECIFIED_ESTIMATED_NOISE = _UnspecifiedEstimatedNoise()
+
+
 @dataclass
 class ProcessingMetadata:
     """Metadata associated with processing context."""
@@ -257,14 +264,30 @@ class ProcessingContext:
         """Check if noise estimates exist."""
         return self._estimated_noise is not None
 
-    def set_estimated_noise(self, noise: np.ndarray) -> None:
-        """Set estimated noise (mutable operation)."""
-        self._estimated_noise = noise
+    def set_estimated_noise(self, noise: np.ndarray, *, copy: bool = False) -> None:
+        """Set the estimated noise.
 
-    def accumulate_noise(self, noise: np.ndarray) -> None:
-        """Add to accumulated noise estimates."""
+        Args:
+            noise: Noise array whose shape matches the processed Raw data.
+            copy: Copy ``noise`` before storing it. The default preserves the
+                historical ownership-transfer behaviour and avoids an
+                allocation. Pass ``True`` when the caller will continue
+                mutating its array.
+        """
+        self._estimated_noise = noise.copy() if copy else noise
+
+    def accumulate_noise(self, noise: np.ndarray, *, copy: bool = True) -> None:
+        """Add to accumulated noise estimates.
+
+        Args:
+            noise: Noise contribution to accumulate.
+            copy: When this is the first contribution, copy it before storing.
+                The default preserves the historical behaviour. Callers may
+                pass ``False`` to transfer ownership of a newly allocated
+                array and avoid retaining two identical full-size buffers.
+        """
         if self._estimated_noise is None:
-            self._estimated_noise = noise.copy()
+            self._estimated_noise = noise.copy() if copy else noise
         else:
             self._estimated_noise += noise
 
@@ -314,42 +337,103 @@ class ProcessingContext:
         """Clear cache."""
         self._cache.clear()
 
+    def release_signal_data(self) -> None:
+        """Release signal-sized state while retaining metadata and history.
+
+        This operation is intended for completed batch and chunk results whose
+        metrics and processing history still need to be inspected. Raw data,
+        original Raw data, estimated noise, and cached derived values become
+        unavailable after the call.
+        """
+        self._raw = None
+        self._raw_original = None
+        self._estimated_noise = None
+        self.cache_clear()
+
     # =========================================================================
     # Immutable Operations (Return New Context)
     # =========================================================================
 
-    def with_raw(self, raw: mne.io.Raw, copy_metadata: bool = True) -> "ProcessingContext":
+    @staticmethod
+    def _prepare_estimated_noise(
+        noise: np.ndarray | None,
+        *,
+        copy_estimated_noise: bool,
+    ) -> np.ndarray | None:
+        """Copy or transfer an estimated-noise array for a new context."""
+        if noise is None or not copy_estimated_noise:
+            return noise
+        return noise.copy()
+
+    def with_raw(
+        self,
+        raw: mne.io.Raw,
+        copy_metadata: bool = True,
+        *,
+        estimated_noise: np.ndarray | None | _UnspecifiedEstimatedNoise = _UNSPECIFIED_ESTIMATED_NOISE,
+        copy_estimated_noise: bool = True,
+    ) -> "ProcessingContext":
         """
         Create new context with updated Raw object.
 
         Args:
             raw: New Raw object
             copy_metadata: Whether to copy metadata from current context
+            estimated_noise: Replacement estimated-noise array. When omitted,
+                the current estimate is preserved. Pass ``None`` explicitly to
+                create the new context without an estimate.
+            copy_estimated_noise: Copy the preserved or replacement estimate.
+                This defaults to ``True`` so ordinary immutable context
+                operations keep independent arrays. Set it to ``False`` only
+                when deliberately transferring ownership or sharing a
+                read-only estimate.
 
         Returns:
             New ProcessingContext
         """
         metadata = self._metadata.copy() if copy_metadata else ProcessingMetadata()
+        noise = self._estimated_noise if isinstance(estimated_noise, _UnspecifiedEstimatedNoise) else estimated_noise
 
         new_ctx = ProcessingContext(raw=raw, raw_original=self._raw_original, metadata=metadata)
         new_ctx._history = self._history.copy()
-        new_ctx._estimated_noise = self._estimated_noise.copy() if self._estimated_noise is not None else None
+        new_ctx._estimated_noise = self._prepare_estimated_noise(
+            noise,
+            copy_estimated_noise=copy_estimated_noise,
+        )
         # Don't copy cache (it may be invalidated)
         return new_ctx
 
-    def with_metadata(self, metadata: ProcessingMetadata) -> "ProcessingContext":
+    def with_metadata(
+        self,
+        metadata: ProcessingMetadata,
+        *,
+        estimated_noise: np.ndarray | None | _UnspecifiedEstimatedNoise = _UNSPECIFIED_ESTIMATED_NOISE,
+        copy_estimated_noise: bool = True,
+    ) -> "ProcessingContext":
         """
         Create new context with updated metadata.
 
         Args:
             metadata: New metadata
+            estimated_noise: Replacement estimated-noise array. When omitted,
+                the current estimate is preserved. Pass ``None`` explicitly to
+                create the new context without an estimate.
+            copy_estimated_noise: Copy the preserved or replacement estimate.
+                This defaults to ``True`` to preserve immutable-operation
+                behaviour. Set it to ``False`` only for an intentional
+                ownership transfer or read-only share.
 
         Returns:
             New ProcessingContext
         """
+        noise = self._estimated_noise if isinstance(estimated_noise, _UnspecifiedEstimatedNoise) else estimated_noise
+
         new_ctx = ProcessingContext(raw=self._raw, raw_original=self._raw_original, metadata=metadata)
         new_ctx._history = self._history.copy()
-        new_ctx._estimated_noise = self._estimated_noise.copy() if self._estimated_noise is not None else None
+        new_ctx._estimated_noise = self._prepare_estimated_noise(
+            noise,
+            copy_estimated_noise=copy_estimated_noise,
+        )
         return new_ctx
 
     def with_triggers(self, triggers: np.ndarray) -> "ProcessingContext":
@@ -589,9 +673,15 @@ class ProcessingContext:
         Returns:
             Dictionary representation
         """
+        raw_data = getattr(self._raw, "_data", None)
+        if not self._raw.preload or raw_data is None:
+            raw_data = self._call_raw_get_data(copy=False)
+
         return {
-            "raw": self._raw,
-            "raw_data": self._call_raw_get_data(copy=False),
+            # Reuse the preloaded buffer when possible. MNE versions without
+            # ``Raw.get_data(copy=False)`` otherwise allocate a redundant
+            # signal-sized array before multiprocessing pickles the payload.
+            "raw_data": raw_data,
             "raw_info": self._raw.info,
             "metadata": self._metadata.to_dict(),
             "history": [

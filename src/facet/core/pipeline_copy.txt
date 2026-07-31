@@ -312,18 +312,15 @@ class PipelineResult:
 
     def release_raw(self) -> None:
         """
-        Release signal-sized data held by the context to free memory.
+        Release the Raw data held by the context to free memory.
 
         After calling this, ``get_raw()`` and ``plot()`` will no longer work,
-        and estimated noise and cached derived values are discarded. Metrics,
-        processing history, and ``execution_time`` remain accessible. Useful
-        when running batch jobs where only summary statistics are needed.
-
-        The method name is retained for API compatibility; it now releases all
-        signal-sized state so ``keep_raw=False`` genuinely bounds memory.
+        but :attr:`metrics` and ``execution_time`` remain accessible.
+        Useful when running batch jobs where you only need summary statistics.
         """
         if self.context is not None:
-            self.context.release_signal_data()
+            self.context._raw = None
+            self.context._raw_original = None
 
     def __repr__(self) -> str:
         status = "SUCCESS" if self.success else "FAILED"
@@ -455,7 +452,7 @@ class BatchResult:
 
 @dataclass(frozen=True)
 class ChunkSpec:
-    """Description of one computational chunk and its non-overlapping core."""
+    """Description of one fixed-length raw-data chunk."""
 
     index: int
     total: int
@@ -463,60 +460,11 @@ class ChunkSpec:
     stop_sample: int
     sfreq: float
     output_path: Path
-    core_start_sample: int | None = None
-    core_stop_sample: int | None = None
 
     @property
     def duration_seconds(self) -> float:
-        """Return computational-context duration in seconds."""
+        """Return chunk duration in seconds."""
         return (self.stop_sample - self.start_sample) / self.sfreq
-
-    @property
-    def resolved_core_start_sample(self) -> int:
-        """Return the inclusive source-sample start written to output."""
-        return self.start_sample if self.core_start_sample is None else self.core_start_sample
-
-    @property
-    def resolved_core_stop_sample(self) -> int:
-        """Return the exclusive source-sample stop written to output."""
-        return self.stop_sample if self.core_stop_sample is None else self.core_stop_sample
-
-    @property
-    def left_overlap_samples(self) -> int:
-        """Return context samples preceding the emitted core."""
-        return self.resolved_core_start_sample - self.start_sample
-
-    @property
-    def right_overlap_samples(self) -> int:
-        """Return context samples following the emitted core."""
-        return self.stop_sample - self.resolved_core_stop_sample
-
-
-class _CropChunkToCore(Processor):
-    """Crop processed overlap away immediately before chunk export."""
-
-    name = "crop_chunk_to_core"
-    description = "Crop computational overlap to the non-overlapping output core"
-    requires_raw = True
-    modifies_raw = True
-    parallel_safe = False
-
-    def __init__(self, chunk: ChunkSpec) -> None:
-        self.chunk = chunk
-        super().__init__()
-
-    def process(self, context: ProcessingContext) -> ProcessingContext:
-        core_start = self.chunk.resolved_core_start_sample
-        core_stop = self.chunk.resolved_core_stop_sample
-        if core_start == self.chunk.start_sample and core_stop == self.chunk.stop_sample:
-            return context
-
-        raw = context.get_raw()
-        source_sfreq = self.chunk.sfreq
-        tmin = (core_start - self.chunk.start_sample) / source_sfreq
-        tmax = (core_stop - self.chunk.start_sample - 1) / source_sfreq
-        raw.crop(tmin=tmin, tmax=tmax, verbose=False)
-        return context
 
 
 class ChunkedPipelineResult:
@@ -550,18 +498,6 @@ class ChunkedPipelineResult:
 
     def __len__(self) -> int:
         return len(self._results)
-
-    @property
-    def results(self) -> list[PipelineResult]:
-        """Return per-chunk results for programmatic aggregation.
-
-        This public accessor is intentionally provided because validation and
-        grid-search runners need to read metrics from each completed chunk.
-        Previously only ``_results`` existed, so callers looking for
-        ``results`` could not access chunk metrics and produced runtime-only
-        CSV files.
-        """
-        return self._results
 
     @property
     def output_paths(self) -> list[Path]:
@@ -1121,11 +1057,8 @@ class Pipeline:
         min_chunks: int = 2,
         max_chunks: int = 128,
         memory_budget_mb: float | None = None,
-        max_memory_mb: float | None = None,
         memory_fraction: float = 0.5,
         processing_memory_multiplier: float = 4.0,
-        disable_chunking: bool = False,
-        force_full_run: bool = False,
         overwrite: bool = True,
         parallel: bool = False,
         n_jobs: int = -1,
@@ -1145,11 +1078,10 @@ class Pipeline:
         The input is opened lazily to inspect its sampling rate and sample
         count. If the pipeline contains a ``TriggerDetector``, chunks are built
         around trigger sections by default so that every AAS chunk contains
-        triggers. Oversized sections are split between triggers while retaining
-        the correction processor's required trigger context. Otherwise the
-        method falls back to fixed-length chunks, starting with ``min_chunks``
-        and increasing the division count until the estimated peak memory per
-        chunk fits inside the requested or available memory budget.
+        triggers. Otherwise the method falls back to fixed-length chunks,
+        starting with ``min_chunks`` and increasing the division count until the
+        estimated peak memory per chunk fits inside the requested or available
+        memory budget.
 
         The pipeline passed to ``run_chunked`` should contain processing steps
         only. Loading and exporting are handled here so that every chunk gets a
@@ -1172,25 +1104,15 @@ class Pipeline:
             Factory receiving an output path and returning an exporter
             processor. Defaults to ``Exporter(path=..., overwrite=...)``.
         min_chunks, max_chunks : int
-            Search range for fixed-length chunks. ``max_chunks`` is also the
-            safety limit for memory-bounded trigger-section subdivisions.
+            Search range for the automatic chunk count.
         memory_budget_mb : float, optional
             Explicit per-chunk memory budget. If omitted, a fraction of
             currently available system memory is used when detectable.
-        max_memory_mb : float, optional
-            Preferred spelling for an explicit memory ceiling. Mutually
-            exclusive with ``memory_budget_mb``.
         memory_fraction : float
             Fraction of available memory to use when ``memory_budget_mb`` is
             not supplied.
         processing_memory_multiplier : float
             Safety multiplier for intermediate arrays and copies.
-        disable_chunking : bool
-            Process the complete recording as one computational window after
-            verifying that its estimated peak memory is safe.
-        force_full_run : bool
-            Permit ``disable_chunking`` even when the estimate exceeds the
-            safe memory ceiling. This may exhaust system memory.
         overwrite : bool
             Passed to the default exporter.
         on_error : {"raise", "continue"}
@@ -1199,16 +1121,15 @@ class Pipeline:
             If ``False``, release each successful chunk's Raw object after
             export so only metadata/results remain in memory.
         chunk_by_trigger_sections : bool, optional
-            If ``True``, build output chunks from detected trigger sections,
-            subdividing only sections that exceed the memory budget. If
-            ``None`` (default), this is enabled automatically when the pipeline
-            contains a ``TriggerDetector``.
+            If ``True``, build one output chunk per detected trigger section.
+            If ``None`` (default), this is enabled automatically when the
+            pipeline contains a ``TriggerDetector``.
         trigger_section_padding_seconds : float
             Seconds to include before the first trigger and after the last
             trigger in each detected section.
         trigger_section_min_triggers : int
             Minimum trigger count required for a trigger cluster to be treated
-            as a section and for each memory-bounded subdivision.
+            as a section.
         trigger_section_gap_seconds : float, optional
             Explicit gap threshold for splitting trigger sections. If omitted,
             a robust threshold is estimated from the trigger spacing.
@@ -1234,13 +1155,6 @@ class Pipeline:
             raise ValueError("on_error must be 'raise' or 'continue'")
         if not (0 < memory_fraction <= 1):
             raise ValueError("memory_fraction must be in (0, 1]")
-        if memory_budget_mb is not None and max_memory_mb is not None:
-            raise ValueError("Pass only one of memory_budget_mb and max_memory_mb")
-        explicit_memory_mb = max_memory_mb if max_memory_mb is not None else memory_budget_mb
-        if explicit_memory_mb is not None and explicit_memory_mb <= 0:
-            raise ValueError("max_memory_mb must be positive")
-        if force_full_run and not disable_chunking:
-            raise ValueError("force_full_run requires disable_chunking=True")
         if processing_memory_multiplier <= 0:
             raise ValueError("processing_memory_multiplier must be positive")
         if trigger_section_padding_seconds < 0:
@@ -1251,7 +1165,7 @@ class Pipeline:
             raise ValueError("trigger_section_gap_seconds must be positive when provided")
         # if trigger_section_max_sections < 1:
         #     raise ValueError("trigger_section_max_sections must be >= 1")
-        if trigger_section_max_sections is not None and trigger_section_max_sections < 1:
+        if ( trigger_section_max_sections is not None and trigger_section_max_sections < 1):
             raise ValueError("trigger_section_max_sections must be >= 1")
 
         exporter_types = tuple(_EXTENSION_EXPORTERS.values()) + (_Exporter,)
@@ -1283,27 +1197,7 @@ class Pipeline:
         sample_bytes = self._raw_sample_bytes(probe_raw)
         peak_sample_multiplier = self._peak_sample_multiplier()
 
-        available_memory = self._available_memory_bytes(os)
-        memory_budget = self._memory_budget_bytes(explicit_memory_mb, memory_fraction, os)
-        safe_memory_limit = (
-            memory_budget
-            if explicit_memory_mb is not None
-            else max(memory_budget, int(available_memory * 0.8))
-        )
-        bytes_per_input_sample = self._estimated_bytes_per_input_sample(
-            n_channels=n_channels,
-            sample_bytes=sample_bytes,
-            peak_sample_multiplier=peak_sample_multiplier,
-            processing_memory_multiplier=processing_memory_multiplier,
-            channel_sequential=channel_sequential,
-        )
-        logger.info(
-            "Chunk memory diagnostics: available RAM {:.2f} GiB, normal budget {:.2f} GiB, "
-            "estimated {:.1f} bytes per input sample",
-            available_memory / 1024**3,
-            memory_budget / 1024**3,
-            bytes_per_input_sample,
-        )
+        memory_budget = self._memory_budget_bytes(memory_budget_mb, memory_fraction, os)
         trigger_detector = self._find_trigger_detector_for_chunking()
         if chunk_by_trigger_sections is None:
             use_trigger_sections = trigger_detector is not None
@@ -1311,75 +1205,19 @@ class Pipeline:
             use_trigger_sections = chunk_by_trigger_sections
 
         trigger_section_chunks: list[ChunkSpec] | None = None
-        trigger_samples_for_chunking = None
-        trigger_chunk_sample_limit: int | None = None
-        trigger_chunk_min_triggers: int | None = None
         chunking_mode = "fixed_length"
-        selected_padding_seconds = trigger_section_padding_seconds
-        if disable_chunking:
-            full_run_estimate = int(n_times * bytes_per_input_sample)
-            if full_run_estimate > safe_memory_limit and not channel_sequential:
-                sequential_bytes = self._estimated_bytes_per_input_sample(
-                    n_channels=n_channels,
-                    sample_bytes=sample_bytes,
-                    peak_sample_multiplier=peak_sample_multiplier,
-                    processing_memory_multiplier=processing_memory_multiplier,
-                    channel_sequential=True,
-                )
-                sequential_estimate = int(n_times * sequential_bytes)
-                if sequential_estimate <= safe_memory_limit:
-                    channel_sequential = True
-                    bytes_per_input_sample = sequential_bytes
-                    full_run_estimate = sequential_estimate
-                    logger.warning("Full-run fallback selected channel-sequential processing")
-
-            logger.info(
-                "Full-run estimate: {:.2f} GiB for {} samples; safe limit {:.2f} GiB",
-                full_run_estimate / 1024**3,
-                n_times,
-                safe_memory_limit / 1024**3,
-            )
-            if full_run_estimate > safe_memory_limit and not force_full_run:
-                raise PipelineError(
-                    "Full-run processing is not memory-safe: estimated "
-                    f"{full_run_estimate / 1024**3:.2f} GiB exceeds the safe "
-                    f"{safe_memory_limit / 1024**3:.2f} GiB limit. "
-                    "Enable chunking, raise max_memory_mb, or explicitly set force_full_run=True."
-                )
-            if full_run_estimate > safe_memory_limit:
-                logger.warning("Forced full-run processing exceeds the safe memory estimate")
-
-            output_path = output_root / f"{stem}_chunk_001_of_001{extension}"
-            trigger_section_chunks = [
-                ChunkSpec(
-                    index=1,
-                    total=1,
-                    start_sample=0,
-                    stop_sample=n_times,
-                    sfreq=sfreq,
-                    output_path=output_path,
-                    core_start_sample=0,
-                    core_stop_sample=n_times,
-                )
-            ]
-            chunking_mode = "full_run"
-            attempt_chunks = 1
-            retry_limit = 1
-            logger.info("Chunk fallback strategy selected: checked full-run processing")
-
-        elif use_trigger_sections:
+        if use_trigger_sections:
             if trigger_detector is None:
-                raise ValueError("chunk_by_trigger_sections=True requires a TriggerDetector in the pipeline")
+                raise ValueError(
+                    "chunk_by_trigger_sections=True requires a TriggerDetector in the pipeline"
+                )
 
             trigger_context = self._detect_triggers_for_chunking(probe_context)
             triggers = trigger_context.get_triggers()
             if triggers is None or len(triggers) == 0:
                 raise PipelineError("Cannot build trigger-section chunks: no triggers were detected")
 
-            trigger_samples_for_chunking = triggers
-            trigger_chunk_sample_limit = max(1, int(memory_budget // bytes_per_input_sample))
-            trigger_chunk_min_triggers = self._minimum_trigger_context(trigger_section_min_triggers)
-            minimum_limit, minimum_chunks = self._minimum_valid_trigger_chunk_plan(
+            trigger_section_chunks = self._make_trigger_section_chunks(
                 raw=probe_raw,
                 triggers=triggers,
                 output_dir=output_root,
@@ -1389,153 +1227,10 @@ class Pipeline:
                 min_triggers=trigger_section_min_triggers,
                 gap_seconds=trigger_section_gap_seconds,
                 max_sections=trigger_section_max_sections,
-                min_chunk_triggers=trigger_chunk_min_triggers,
             )
-            minimum_estimated_memory = int(minimum_limit * bytes_per_input_sample)
-            logger.info(
-                "Trigger chunk diagnostics: normal limit {} samples; minimum valid "
-                "trigger-aligned chunk {} samples ({:.2f} GiB estimated); "
-                "minimum context {} triggers",
-                trigger_chunk_sample_limit,
-                minimum_limit,
-                minimum_estimated_memory / 1024**3,
-                trigger_chunk_min_triggers,
-            )
-
-            if trigger_chunk_sample_limit >= minimum_limit:
-                trigger_section_chunks = self._make_trigger_section_chunks(
-                    raw=probe_raw,
-                    triggers=triggers,
-                    output_dir=output_root,
-                    output_stem=stem,
-                    extension=extension,
-                    padding_seconds=selected_padding_seconds,
-                    min_triggers=trigger_section_min_triggers,
-                    gap_seconds=trigger_section_gap_seconds,
-                    max_sections=trigger_section_max_sections,
-                    max_chunk_samples=trigger_chunk_sample_limit,
-                    min_chunk_triggers=trigger_chunk_min_triggers,
-                )
-                logger.info("Chunk fallback strategy selected: normal memory-efficient trigger chunks")
-            elif minimum_estimated_memory <= safe_memory_limit:
-                trigger_chunk_sample_limit = minimum_limit
-                trigger_section_chunks = minimum_chunks
-                logger.warning(
-                    "Chunk fallback strategy selected: enlarged to the smallest valid "
-                    "trigger-aligned chunk ({} samples)",
-                    minimum_limit,
-                )
-            else:
-                reduced_limit, reduced_chunks = self._minimum_valid_trigger_chunk_plan(
-                    raw=probe_raw,
-                    triggers=triggers,
-                    output_dir=output_root,
-                    output_stem=stem,
-                    extension=extension,
-                    padding_seconds=0.0,
-                    min_triggers=trigger_section_min_triggers,
-                    gap_seconds=trigger_section_gap_seconds,
-                    max_sections=trigger_section_max_sections,
-                    min_chunk_triggers=trigger_chunk_min_triggers,
-                )
-                reduced_estimate = int(reduced_limit * bytes_per_input_sample)
-                if reduced_estimate <= safe_memory_limit:
-                    selected_padding_seconds = 0.0
-                    trigger_chunk_sample_limit = reduced_limit
-                    trigger_section_chunks = reduced_chunks
-                    logger.warning(
-                        "Chunk fallback strategy selected: removed optional section padding "
-                        "and used {}-sample trigger chunks",
-                        reduced_limit,
-                    )
-                elif not channel_sequential:
-                    sequential_bytes = self._estimated_bytes_per_input_sample(
-                        n_channels=n_channels,
-                        sample_bytes=sample_bytes,
-                        peak_sample_multiplier=peak_sample_multiplier,
-                        processing_memory_multiplier=processing_memory_multiplier,
-                        channel_sequential=True,
-                    )
-                    sequential_estimate = int(reduced_limit * sequential_bytes)
-                    if sequential_estimate <= safe_memory_limit:
-                        channel_sequential = True
-                        bytes_per_input_sample = sequential_bytes
-                        selected_padding_seconds = 0.0
-                        trigger_chunk_sample_limit = max(
-                            reduced_limit,
-                            int(memory_budget // sequential_bytes),
-                        )
-                        trigger_section_chunks = self._make_trigger_section_chunks(
-                            raw=probe_raw,
-                            triggers=triggers,
-                            output_dir=output_root,
-                            output_stem=stem,
-                            extension=extension,
-                            padding_seconds=selected_padding_seconds,
-                            min_triggers=trigger_section_min_triggers,
-                            gap_seconds=trigger_section_gap_seconds,
-                            max_sections=trigger_section_max_sections,
-                            max_chunk_samples=trigger_chunk_sample_limit,
-                            min_chunk_triggers=trigger_chunk_min_triggers,
-                        )
-                        logger.warning(
-                            "Chunk fallback strategy selected: channel-sequential processing "
-                            "with {}-sample trigger chunks",
-                            trigger_chunk_sample_limit,
-                        )
-                    else:
-                        raise PipelineError(
-                            self._minimum_chunk_memory_error(
-                                reduced_limit,
-                                sequential_estimate,
-                                safe_memory_limit,
-                                trigger_chunk_min_triggers,
-                            )
-                        )
-                else:
-                    raise PipelineError(
-                        self._minimum_chunk_memory_error(
-                            reduced_limit,
-                            reduced_estimate,
-                            safe_memory_limit,
-                            trigger_chunk_min_triggers,
-                        )
-                    )
             chunking_mode = "trigger_sections"
             attempt_chunks = len(trigger_section_chunks)
-            retry_limit = max_chunks
-
-            for planned_chunk in trigger_section_chunks:
-                context_trigger_count = sum(
-                    planned_chunk.start_sample <= int(sample) < planned_chunk.stop_sample
-                    for sample in triggers
-                )
-                core_trigger_count = sum(
-                    planned_chunk.resolved_core_start_sample
-                    <= int(sample)
-                    < planned_chunk.resolved_core_stop_sample
-                    for sample in triggers
-                )
-                logger.info(
-                    "Planned trigger chunk {}/{}: {} context trigger(s), {} core trigger(s), "
-                    "context {}:{}, core {}:{}, overlap left/right={}/{}",
-                    planned_chunk.index,
-                    planned_chunk.total,
-                    context_trigger_count,
-                    core_trigger_count,
-                    planned_chunk.start_sample,
-                    planned_chunk.stop_sample,
-                    planned_chunk.resolved_core_start_sample,
-                    planned_chunk.resolved_core_stop_sample,
-                    planned_chunk.left_overlap_samples,
-                    planned_chunk.right_overlap_samples,
-                )
-
-            if attempt_chunks > retry_limit:
-                raise PipelineError(
-                    "Trigger-section memory budgeting requires "
-                    f"{attempt_chunks} chunks, exceeding max_chunks={max_chunks}"
-                )
+            retry_limit = attempt_chunks
 
             logger.info(
                 "Chunking {} into {} trigger-section window(s): {} samples, {} channels, {} Hz",
@@ -1588,16 +1283,11 @@ class Pipeline:
             try:
                 for chunk in chunks:
                     logger.info(
-                        "Processing chunk {}/{}: context {}:{}, core {}:{}, "
-                        "overlap left/right={}/{} samples -> {}",
+                        "Processing chunk {}/{}: samples {}:{} -> {}",
                         chunk.index,
                         chunk.total,
                         chunk.start_sample,
                         chunk.stop_sample,
-                        chunk.resolved_core_start_sample,
-                        chunk.resolved_core_stop_sample,
-                        chunk.left_overlap_samples,
-                        chunk.right_overlap_samples,
                         chunk.output_path,
                     )
 
@@ -1614,13 +1304,7 @@ class Pipeline:
                         "total": chunk.total,
                         "start_sample": chunk.start_sample,
                         "stop_sample": chunk.stop_sample,
-                        "core_start_sample": chunk.resolved_core_start_sample,
-                        "core_stop_sample": chunk.resolved_core_stop_sample,
-                        "left_overlap_samples": chunk.left_overlap_samples,
-                        "right_overlap_samples": chunk.right_overlap_samples,
                         "chunking_mode": chunking_mode,
-                        "computational_chunk": True,
-                        "logical_run_id": stem,
                         "source_path": input_path,
                         "output_path": str(chunk.output_path),
                     }
@@ -1631,7 +1315,7 @@ class Pipeline:
                         else _Exporter(path=str(chunk.output_path), overwrite=overwrite)
                     )
                     chunk_pipeline = Pipeline(
-                        [*self.processors, _CropChunkToCore(chunk), exporter],
+                        [*self.processors, exporter],
                         name=f"{self.name} chunk {chunk.index}/{chunk.total}",
                     )
                     result = chunk_pipeline.run(
@@ -1649,19 +1333,9 @@ class Pipeline:
                             raise result.error
 
                     if result.success and not keep_raw:
-                        # Retain metrics/history, but discard all signal-sized
-                        # arrays and cached derived values.
                         result.release_raw()
 
                     results.append(result)
-
-                    # Drop per-chunk loader/context references immediately.
-                    # The result retained above contains only metadata when
-                    # keep_raw=False.
-                    chunk_context = None
-                    chunk_loader = None
-                    exporter = None
-                    chunk_pipeline = None
                     gc.collect()
 
                 execution_time = time.time() - start_time
@@ -1684,77 +1358,7 @@ class Pipeline:
                 )
 
             except MemoryError:
-                if trigger_section_chunks is not None:
-                    if chunking_mode == "trigger_sections" and not channel_sequential:
-                        channel_sequential = True
-                        logger.warning(
-                            "Trigger-section allocation failed; retrying the same "
-                            "trigger-aligned plan channel-sequentially"
-                        )
-                        gc.collect()
-                        continue
-
-                    if (
-                        attempt_chunks >= retry_limit
-                        or trigger_samples_for_chunking is None
-                        or trigger_chunk_sample_limit is None
-                        or trigger_chunk_min_triggers is None
-                    ):
-                        raise
-
-                    previous_count = len(trigger_section_chunks)
-                    previous_largest = max(chunk.stop_sample - chunk.start_sample for chunk in trigger_section_chunks)
-                    next_limit = trigger_chunk_sample_limit
-                    replacement_chunks: list[ChunkSpec] | None = None
-
-                    # The static estimate is necessarily approximate. On a
-                    # real allocation failure, progressively tighten the
-                    # sample limit until it creates a smaller safe processing
-                    # window or cannot be reduced further.
-                    while next_limit > 1:
-                        next_limit = max(1, next_limit // 2)
-                        try:
-                            candidate_chunks = self._make_trigger_section_chunks(
-                                raw=probe_raw,
-                                triggers=trigger_samples_for_chunking,
-                                output_dir=output_root,
-                                output_stem=stem,
-                                extension=extension,
-                                padding_seconds=selected_padding_seconds,
-                                min_triggers=trigger_section_min_triggers,
-                                gap_seconds=trigger_section_gap_seconds,
-                                max_sections=trigger_section_max_sections,
-                                max_chunk_samples=next_limit,
-                                min_chunk_triggers=trigger_chunk_min_triggers,
-                            )
-                        except PipelineError as split_error:
-                            raise MemoryError(
-                                "Trigger sections cannot be subdivided further without "
-                                f"dropping the required {trigger_chunk_min_triggers}-trigger "
-                                "Flex context"
-                            ) from split_error
-
-                        candidate_largest = max(chunk.stop_sample - chunk.start_sample for chunk in candidate_chunks)
-                        if len(candidate_chunks) > previous_count or candidate_largest < previous_largest:
-                            replacement_chunks = candidate_chunks
-                            break
-
-                    if replacement_chunks is None or len(replacement_chunks) > retry_limit:
-                        raise
-
-                    trigger_section_chunks = replacement_chunks
-                    trigger_chunk_sample_limit = next_limit
-                    attempt_chunks = len(replacement_chunks)
-                    logger.warning(
-                        "Trigger-section run exceeded memory; retrying with {} "
-                        "safe trigger chunks (maximum {} samples each)",
-                        attempt_chunks,
-                        trigger_chunk_sample_limit,
-                    )
-                    gc.collect()
-                    continue
-
-                if attempt_chunks >= retry_limit:
+                if trigger_section_chunks is not None or attempt_chunks >= retry_limit:
                     raise
                 attempt_chunks += 1
                 logger.warning("Chunk run exceeded memory; retrying with {} chunks", attempt_chunks)
@@ -1838,124 +1442,17 @@ class Pipeline:
         if memory_budget_mb is not None:
             return int(memory_budget_mb * 1024 * 1024)
 
-        return max(1, int(Pipeline._available_memory_bytes(os_module) * memory_fraction))
-
-    @staticmethod
-    def _available_memory_bytes(os_module) -> int:
-        """Return currently available physical memory with a safe fallback."""
         try:
             pages = os_module.sysconf("SC_AVPHYS_PAGES")
             page_size = os_module.sysconf("SC_PAGE_SIZE")
-            return max(1, int(pages * page_size))
+            return max(1, int(pages * page_size * memory_fraction))
         except (AttributeError, OSError, ValueError):
             fallback_gb = 2
             logger.warning(
-                "Could not determine available memory; assuming a conservative {} GiB",
+                "Could not determine available memory; using conservative {} GiB chunk budget",
                 fallback_gb,
             )
-            return int(fallback_gb * 1024**3)
-
-    @staticmethod
-    def _estimated_bytes_per_input_sample(
-        n_channels: int,
-        sample_bytes: int,
-        peak_sample_multiplier: float,
-        processing_memory_multiplier: float,
-        *,
-        channel_sequential: bool,
-    ) -> float:
-        """Estimate resident and intermediate bytes for one time sample."""
-        if not channel_sequential:
-            return float(
-                n_channels
-                * sample_bytes
-                * peak_sample_multiplier
-                * processing_memory_multiplier
-            )
-
-        resident_bytes = n_channels * sample_bytes
-        intermediate_bytes = (
-            1
-            * sample_bytes
-            * peak_sample_multiplier
-            * processing_memory_multiplier
-        )
-        return float(resident_bytes + intermediate_bytes)
-
-    @staticmethod
-    def _minimum_chunk_memory_error(
-        minimum_samples: int,
-        estimated_bytes: int,
-        safe_memory_limit: int,
-        min_chunk_triggers: int,
-    ) -> str:
-        """Build the terminal adaptive-chunking memory error."""
-        return (
-            "The minimum scientifically valid Flex chunk cannot fit safely in available memory: "
-            f"{minimum_samples} samples containing at least {min_chunk_triggers} consecutive triggers "
-            f"require an estimated {estimated_bytes / 1024**3:.2f} GiB, but the safe limit is "
-            f"{safe_memory_limit / 1024**3:.2f} GiB. Optional padding and channel-sequential "
-            "fallbacks were exhausted; increase available RAM or set max_memory_mb explicitly."
-        )
-
-    @staticmethod
-    def _minimum_valid_trigger_chunk_plan(
-        *,
-        raw,
-        triggers,
-        output_dir: Path,
-        output_stem: str,
-        extension: str,
-        padding_seconds: float,
-        min_triggers: int,
-        gap_seconds: float | None,
-        max_sections: int | None,
-        min_chunk_triggers: int,
-    ) -> tuple[int, list[ChunkSpec]]:
-        """Find the smallest actual-sample limit yielding a valid trigger plan."""
-        low = 1
-        high = int(raw.n_times)
-        best_chunks: list[ChunkSpec] | None = None
-
-        while low < high:
-            candidate = (low + high) // 2
-            try:
-                chunks = Pipeline._make_trigger_section_chunks(
-                    raw=raw,
-                    triggers=triggers,
-                    output_dir=output_dir,
-                    output_stem=output_stem,
-                    extension=extension,
-                    padding_seconds=padding_seconds,
-                    min_triggers=min_triggers,
-                    gap_seconds=gap_seconds,
-                    max_sections=max_sections,
-                    max_chunk_samples=candidate,
-                    min_chunk_triggers=min_chunk_triggers,
-                    log_details=False,
-                )
-            except PipelineError:
-                low = candidate + 1
-            else:
-                high = candidate
-                best_chunks = chunks
-
-        if best_chunks is None:
-            best_chunks = Pipeline._make_trigger_section_chunks(
-                raw=raw,
-                triggers=triggers,
-                output_dir=output_dir,
-                output_stem=output_stem,
-                extension=extension,
-                padding_seconds=padding_seconds,
-                min_triggers=min_triggers,
-                gap_seconds=gap_seconds,
-                max_sections=max_sections,
-                max_chunk_samples=low,
-                min_chunk_triggers=min_chunk_triggers,
-                log_details=False,
-            )
-        return low, best_chunks
+            return int(fallback_gb * 1024**3 * memory_fraction)
 
     @staticmethod
     def _choose_chunk_count(
@@ -1973,7 +1470,11 @@ class Pipeline:
         for n_chunks in range(min_chunks, max_chunks + 1):
             chunk_samples = int(math_module.ceil(n_times / n_chunks))
             estimated = (
-                n_channels * chunk_samples * sample_bytes * peak_sample_multiplier * processing_memory_multiplier
+                n_channels
+                * chunk_samples
+                * sample_bytes
+                * peak_sample_multiplier
+                * processing_memory_multiplier
             )
             if estimated <= memory_budget:
                 logger.info(
@@ -1989,39 +1490,6 @@ class Pipeline:
             max_chunks,
         )
         return max_chunks
-
-    @staticmethod
-    def _max_chunk_samples_for_budget(
-        n_channels: int,
-        sample_bytes: int,
-        peak_sample_multiplier: float,
-        processing_memory_multiplier: float,
-        memory_budget: int,
-    ) -> int:
-        """Return the largest estimated input window fitting the RAM budget."""
-        bytes_per_input_sample = n_channels * sample_bytes * peak_sample_multiplier * processing_memory_multiplier
-        if bytes_per_input_sample <= 0:
-            raise ValueError("Chunk memory estimate must be positive")
-        return max(1, int(memory_budget // bytes_per_input_sample))
-
-    def _minimum_trigger_context(self, configured_minimum: int) -> int:
-        """Return a safe trigger count for a subdivided correction window.
-
-        Template-based processors need enough epochs to build their requested
-        local model. This affects only sections that must be subdivided for
-        memory; ordinary trigger-section output remains unchanged.
-        """
-        required = max(1, int(configured_minimum))
-        for processor in self.processors:
-            window_size = getattr(processor, "window_size", None)
-            if isinstance(window_size, int) and not isinstance(window_size, bool) and window_size > 0:
-                required = max(required, window_size + 1)
-
-            template_count = getattr(processor, "template_count", None)
-            if isinstance(template_count, int) and not isinstance(template_count, bool) and template_count > 0:
-                required = max(required, 2 * template_count + 2)
-
-        return required
 
     @staticmethod
     def _make_fixed_length_chunks(
@@ -2082,18 +1550,9 @@ class Pipeline:
         padding_seconds: float,
         min_triggers: int,
         gap_seconds: float | None,
-        max_sections: int | None,
-        max_chunk_samples: int | None = None,
-        min_chunk_triggers: int | None = None,
-        log_details: bool = True,
+        max_sections: int,
     ) -> list[ChunkSpec]:
-        """Create memory-bounded windows around dense trigger sections.
-
-        Sections that already fit are left byte-for-byte compatible with the
-        historical padded windows. Oversized sections are partitioned only
-        between adjacent triggers, and every child retains the configured
-        minimum trigger context needed by template-based correction.
-        """
+        """Create padded chunk windows around dense trigger sections."""
         import numpy as np
 
         n_times = int(raw.n_times)
@@ -2111,96 +1570,35 @@ class Pipeline:
             min_triggers=min_triggers,
             gap_seconds=gap_seconds,
             max_sections=max_sections,
-            log_details=log_details,
         )
 
-        if max_chunk_samples is not None and max_chunk_samples < 1:
-            raise ValueError("max_chunk_samples must be >= 1 when provided")
-
-        context_triggers = max(
-            min_triggers,
-            min_chunk_triggers if min_chunk_triggers is not None else min_triggers,
-        )
         padding_samples = int(round(padding_seconds * sfreq))
-        padded_sections: list[dict[str, Any]] = []
+        windows: list[dict[str, int]] = []
         for index, section in enumerate(sections, start=1):
             first_trigger = int(section[0])
             last_trigger = int(section[-1])
             start = max(0, first_trigger - padding_samples)
             stop = min(n_times, last_trigger + padding_samples + 1)
-            padded_sections.append(
+            windows.append(
                 {
                     "start": start,
                     "stop": stop,
-                    "triggers": section,
+                    "trigger_count": int(section.size),
+                    "first_trigger": first_trigger,
+                    "last_trigger": last_trigger,
                 }
             )
-            if log_details:
-                logger.info(
-                    "Trigger section {}: {} trigger(s), samples {}:{} -> padded chunk {}:{}",
-                    index,
-                    int(section.size),
-                    first_trigger,
-                    last_trigger,
-                    start,
-                    stop,
-                )
-
-        # Merge overlapping padded source sections before applying the memory
-        # limit. This preserves the original merge semantics without allowing
-        # the padding of newly subdivided children to reassemble them.
-        merged_sections: list[dict[str, Any]] = []
-        for section in padded_sections:
-            if not merged_sections or section["start"] > merged_sections[-1]["stop"]:
-                merged_sections.append(dict(section))
-                continue
-
-            current = merged_sections[-1]
-            current["stop"] = max(current["stop"], section["stop"])
-            current["triggers"] = np.unique(np.concatenate((current["triggers"], section["triggers"])))
-
-        if log_details and len(merged_sections) < len(padded_sections):
             logger.info(
-                "Merged {} overlapping padded trigger window(s) into {} output chunk(s)",
-                len(padded_sections),
-                len(merged_sections),
+                "Trigger section {}: {} trigger(s), samples {}:{} -> padded chunk {}:{}",
+                index,
+                int(section.size),
+                first_trigger,
+                last_trigger,
+                start,
+                stop,
             )
 
-        windows: list[dict[str, int]] = []
-        for section in merged_sections:
-            section_length = int(section["stop"] - section["start"])
-            if max_chunk_samples is None or section_length <= max_chunk_samples:
-                section_triggers = section["triggers"]
-                windows.append(
-                    {
-                        "start": int(section["start"]),
-                        "stop": int(section["stop"]),
-                        "trigger_count": int(section_triggers.size),
-                        "first_trigger": int(section_triggers[0]),
-                        "last_trigger": int(section_triggers[-1]),
-                    }
-                )
-                continue
-
-            if log_details:
-                logger.warning(
-                    "Trigger section samples {}:{} exceeds the {}-sample memory limit; "
-                    "subdividing at trigger boundaries",
-                    section["start"],
-                    section["stop"],
-                    max_chunk_samples,
-                )
-            windows.extend(
-                Pipeline._split_oversized_trigger_window(
-                    trigger_samples=section["triggers"],
-                    outer_start=int(section["start"]),
-                    outer_stop=int(section["stop"]),
-                    max_chunk_samples=max_chunk_samples,
-                    min_chunk_triggers=context_triggers,
-                    log_details=log_details,
-                )
-            )
-
+        windows = Pipeline._merge_trigger_windows(windows)
         total = len(windows)
         width = max(3, len(str(total)))
         chunks: list[ChunkSpec] = []
@@ -2214,104 +1612,9 @@ class Pipeline:
                     stop_sample=window["stop"],
                     sfreq=sfreq,
                     output_path=output_path,
-                    core_start_sample=window.get("core_start", window["start"]),
-                    core_stop_sample=window.get("core_stop", window["stop"]),
                 )
             )
         return chunks
-
-    @staticmethod
-    def _split_oversized_trigger_window(
-        trigger_samples,
-        outer_start: int,
-        outer_stop: int,
-        max_chunk_samples: int,
-        min_chunk_triggers: int,
-        log_details: bool = True,
-    ) -> list[dict[str, int]]:
-        """Partition an oversized section into overlapping trigger contexts.
-
-        Computational windows retain one neighbouring trigger on either side
-        when available. Their ``core_start``/``core_stop`` ranges are an exact,
-        non-overlapping partition of the outer window, so overlap is available
-        to Flex during correction but is never duplicated in exported data.
-        """
-        import numpy as np
-
-        triggers = np.asarray(trigger_samples, dtype=np.int64).ravel()
-        if triggers.size == 0:
-            raise PipelineError("Cannot subdivide an empty trigger section")
-        if min_chunk_triggers < 1:
-            raise ValueError("min_chunk_triggers must be >= 1")
-
-        windows: list[dict[str, int]] = []
-        core_group_start = 0
-        n_triggers = int(triggers.size)
-
-        while core_group_start < n_triggers:
-            first_valid_end = core_group_start + min_chunk_triggers - 1
-            selected_end: int | None = None
-
-            for group_end in range(first_valid_end, n_triggers):
-                remaining = n_triggers - group_end - 1
-                if remaining != 0 and remaining < min_chunk_triggers:
-                    continue
-
-                context_start_index = max(0, core_group_start - 1)
-                context_end_index = min(n_triggers - 1, group_end + 1)
-                context_start = outer_start if context_start_index == 0 else int(triggers[context_start_index])
-                context_stop = (
-                    outer_stop
-                    if context_end_index == n_triggers - 1
-                    else int(triggers[context_end_index + 1])
-                )
-                if context_stop - context_start <= max_chunk_samples:
-                    selected_end = group_end
-                    continue
-                break
-
-            if selected_end is None:
-                raise PipelineError(
-                    "Memory budget is too small for a safe trigger chunk: "
-                    f"at least {min_chunk_triggers} triggers must remain together"
-                )
-
-            context_start_index = max(0, core_group_start - 1)
-            context_end_index = min(n_triggers - 1, selected_end + 1)
-            start_sample = outer_start if context_start_index == 0 else int(triggers[context_start_index])
-            stop_sample = (
-                outer_stop if context_end_index == n_triggers - 1 else int(triggers[context_end_index + 1])
-            )
-            core_start_sample = outer_start if core_group_start == 0 else int(triggers[core_group_start])
-            core_stop_sample = (
-                outer_stop if selected_end == n_triggers - 1 else int(triggers[selected_end + 1])
-            )
-            window = {
-                "start": int(start_sample),
-                "stop": int(stop_sample),
-                "core_start": int(core_start_sample),
-                "core_stop": int(core_stop_sample),
-                "trigger_count": int(context_end_index - context_start_index + 1),
-                "core_trigger_count": int(selected_end - core_group_start + 1),
-                "first_trigger": int(triggers[context_start_index]),
-                "last_trigger": int(triggers[context_end_index]),
-            }
-            windows.append(window)
-            if log_details:
-                logger.info(
-                    "Memory-bounded trigger chunk {}: {} context trigger(s), "
-                    "{} core trigger(s), context {}:{}, core {}:{}",
-                    len(windows),
-                    window["trigger_count"],
-                    window["core_trigger_count"],
-                    window["start"],
-                    window["stop"],
-                    window["core_start"],
-                    window["core_stop"],
-                )
-            core_group_start = selected_end + 1
-
-        return windows
 
     @staticmethod
     def _split_trigger_sections(
@@ -2319,8 +1622,7 @@ class Pipeline:
         sfreq: float,
         min_triggers: int,
         gap_seconds: float | None,
-        max_sections: int | None,
-        log_details: bool = True,
+        max_sections: int,
     ) -> list:
         """Split sorted trigger samples into scan sections."""
         import numpy as np
@@ -2338,16 +1640,15 @@ class Pipeline:
 
         split_points = np.flatnonzero(gaps > threshold_samples) + 1
         sections = [section for section in np.split(trigger_samples, split_points) if section.size > 0]
-        if log_details:
-            logger.info(
-                "Detected {} trigger-section candidate(s) using a {:.2f}s gap threshold",
-                len(sections),
-                threshold_samples / sfreq,
-            )
+        logger.info(
+            "Detected {} trigger-section candidate(s) using a {:.2f}s gap threshold",
+            len(sections),
+            threshold_samples / sfreq,
+        )
 
         valid_sections = [section for section in sections if section.size >= min_triggers]
         skipped = len(sections) - len(valid_sections)
-        if log_details and skipped > 0:
+        if skipped > 0:
             logger.info(
                 "Ignoring {} trigger-section candidate(s) with fewer than {} triggers",
                 skipped,
@@ -2355,12 +1656,11 @@ class Pipeline:
             )
 
         if not valid_sections:
-            if log_details:
-                logger.warning(
-                    "No trigger section reached {} triggers; using all {} trigger(s) as one section",
-                    min_triggers,
-                    trigger_samples.size,
-                )
+            logger.warning(
+                "No trigger section reached {} triggers; using all {} trigger(s) as one section",
+                min_triggers,
+                trigger_samples.size,
+            )
             valid_sections = [trigger_samples]
 
         # if len(valid_sections) > max_sections:
@@ -2373,12 +1673,11 @@ class Pipeline:
         #     valid_sections = sorted(valid_sections, key=lambda section: int(section[0]))
 
         if max_sections is not None and len(valid_sections) > max_sections:
-            if log_details:
-                logger.warning(
-                    "Detected {} trigger sections; keeping the {} largest section(s)",
-                    len(valid_sections),
-                    max_sections,
-                )
+            logger.warning(
+                "Detected {} trigger sections; keeping the {} largest section(s)",
+                len(valid_sections),
+                max_sections,
+            )
             valid_sections = sorted(
                 valid_sections,
                 key=lambda section: section.size,
@@ -2436,18 +1735,12 @@ class Pipeline:
             "execution_time": execution_time,
             "memory_budget_bytes": memory_budget,
             "chunking_mode": chunking_mode,
-            "logical_run_id": Pipeline._source_stem(source_path),
-            "computational_chunks_are_independent_acquisitions": False,
             "chunks": [
                 {
                     "index": chunk.index,
                     "total": chunk.total,
                     "start_sample": chunk.start_sample,
                     "stop_sample": chunk.stop_sample,
-                    "core_start_sample": chunk.resolved_core_start_sample,
-                    "core_stop_sample": chunk.resolved_core_stop_sample,
-                    "left_overlap_samples": chunk.left_overlap_samples,
-                    "right_overlap_samples": chunk.right_overlap_samples,
                     "duration_seconds": chunk.duration_seconds,
                     "output_path": str(chunk.output_path),
                     "success": result.success if i < len(results) else False,

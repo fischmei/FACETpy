@@ -8,6 +8,8 @@ Date: 2025-01-12
 """
 
 import contextlib
+from collections.abc import Iterator, Sequence
+from numbers import Integral
 from typing import Any
 
 import matplotlib.pyplot as plt
@@ -21,6 +23,33 @@ from scipy import signal
 from ..console import get_console, report_metric, suspend_raw_mode
 from ..core import ProcessingContext, Processor, ProcessorValidationError, register_processor
 from ..helpers.plotting import show_matplotlib_figure
+
+DEFAULT_CHANNEL_BLOCK_SIZE = 8
+
+
+def _validate_channel_block_size(channel_block_size: int | None) -> int | None:
+    """Validate and normalize a metric processor's channel block size."""
+    if channel_block_size is None:
+        return None
+    if isinstance(channel_block_size, bool) or not isinstance(channel_block_size, Integral):
+        raise ValueError("channel_block_size must be a positive integer or None")
+    if channel_block_size < 1:
+        raise ValueError("channel_block_size must be a positive integer or None")
+    return int(channel_block_size)
+
+
+def _iter_channel_blocks(
+    picks: Sequence[int] | np.ndarray,
+    channel_block_size: int | None,
+) -> Iterator[np.ndarray]:
+    """Yield stable channel-index blocks without copying signal samples."""
+    pick_array = np.asarray(picks, dtype=int)
+    if pick_array.size == 0:
+        return
+
+    block_size = len(pick_array) if channel_block_size is None else channel_block_size
+    for start in range(0, len(pick_array), block_size):
+        yield pick_array[start : start + block_size]
 
 
 def _dist_summary(values: np.ndarray) -> str:
@@ -84,6 +113,7 @@ class ReferenceDataMixin:
         artifact_length: int,
         time_buffer: float = 0.1,
         context: ProcessingContext | None = None,
+        picks: Sequence[int] | np.ndarray | None = None,
     ) -> np.ndarray:
         """Extract reference data (outside acquisition window).
 
@@ -108,7 +138,7 @@ class ReferenceDataMixin:
             Array of shape (n_channels, n_times) containing concatenated reference data.
         """
         sfreq = raw.info["sfreq"]
-        eeg_picks = self.get_eeg_channels(raw)
+        eeg_picks = self.get_eeg_channels(raw) if picks is None else np.asarray(picks, dtype=int)
 
         if len(eeg_picks) == 0:
             logger.warning("No EEG channels found")
@@ -293,6 +323,7 @@ class ReferenceDataMixin:
         triggers: np.ndarray,
         artifact_length: int,
         context: ProcessingContext | None = None,
+        picks: Sequence[int] | np.ndarray | None = None,
     ) -> np.ndarray:
         """Extract data within the acquisition window.
 
@@ -314,7 +345,7 @@ class ReferenceDataMixin:
         np.ndarray
             Array of shape (n_channels, n_times) from the acquisition window.
         """
-        eeg_picks = self.get_eeg_channels(raw)
+        eeg_picks = self.get_eeg_channels(raw) if picks is None else np.asarray(picks, dtype=int)
 
         if len(eeg_picks) == 0:
             return np.array([])
@@ -467,7 +498,10 @@ class ReferenceIntervalSelector(Processor, ReferenceDataMixin):
         )
 
         # --- RETURN ---
-        return context.with_metadata(new_metadata)
+        return context.with_metadata(
+            new_metadata,
+            copy_estimated_noise=False,
+        )
 
     def _resolve_channel(self, raw: mne.io.BaseRaw) -> int:
         """Resolve configured channel to an EEG channel index."""
@@ -767,7 +801,10 @@ class SignalIntervalSelector(Processor, ReferenceDataMixin):
         )
 
         # --- RETURN ---
-        return context.with_metadata(new_metadata)
+        return context.with_metadata(
+            new_metadata,
+            copy_estimated_noise=False,
+        )
 
     def _resolve_channel(self, raw: mne.io.BaseRaw) -> int:
         """Resolve configured channel to an EEG channel index."""
@@ -979,6 +1016,9 @@ class SNRCalculator(Processor, ReferenceDataMixin):
     ----------
     time_buffer : float, optional
         Time buffer around acquisition window in seconds (default: 0.1).
+    channel_block_size : int or None, optional
+        Number of EEG channels loaded at once. ``None`` restores the legacy
+        all-channel allocation (default: 8).
 
     Examples
     --------
@@ -998,9 +1038,15 @@ class SNRCalculator(Processor, ReferenceDataMixin):
     modifies_raw = False
     parallel_safe = False
 
-    def __init__(self, time_buffer: float = 0.1, verbose: bool = False) -> None:
+    def __init__(
+        self,
+        time_buffer: float = 0.1,
+        verbose: bool = False,
+        channel_block_size: int | None = DEFAULT_CHANNEL_BLOCK_SIZE,
+    ) -> None:
         self.time_buffer = time_buffer
         self.verbose = verbose
+        self.channel_block_size = _validate_channel_block_size(channel_block_size)
         super().__init__()
 
     def validate(self, context: ProcessingContext) -> None:
@@ -1020,25 +1066,46 @@ class SNRCalculator(Processor, ReferenceDataMixin):
         logger.info("Calculating Signal-to-Noise Ratio (SNR)")
 
         # --- COMPUTE ---
-        ref_data = self.get_reference_data(raw, triggers, artifact_length, self.time_buffer, context=context)
-        corrected_data = self.get_acquisition_data(raw, triggers, artifact_length, context=context)
+        corrected_variances: list[np.ndarray] = []
+        reference_variances: list[np.ndarray] = []
+        for block_index, block in enumerate(
+            _iter_channel_blocks(eeg_picks, self.channel_block_size),
+            start=1,
+        ):
+            ref_data = self.get_reference_data(
+                raw,
+                triggers,
+                artifact_length,
+                self.time_buffer,
+                context=context,
+                picks=block,
+            )
+            corrected_data = self.get_acquisition_data(
+                raw,
+                triggers,
+                artifact_length,
+                context=context,
+                picks=block,
+            )
+            if ref_data.size == 0 or corrected_data.size == 0:
+                logger.warning("Insufficient data for SNR calculation")
+                return context
+            if self.verbose:
+                logger.info(
+                    "SNR diagnostics block {}: reference {}; corrected {}",
+                    block_index,
+                    _signal_summary(ref_data),
+                    _signal_summary(corrected_data),
+                )
+            reference_variances.append(np.var(ref_data, axis=1))
+            corrected_variances.append(np.var(corrected_data, axis=1))
 
-        if ref_data.size == 0 or corrected_data.size == 0:
+        if not reference_variances:
             logger.warning("Insufficient data for SNR calculation")
             return context
 
-        if self.verbose:
-            logger.info(
-                "SNR diagnostics: triggers={}, artifact_length={}, time_buffer={:.3f}s",
-                0 if triggers is None else len(triggers),
-                artifact_length,
-                self.time_buffer,
-            )
-            logger.info("SNR diagnostics: reference {}", _signal_summary(ref_data))
-            logger.info("SNR diagnostics: corrected {}", _signal_summary(corrected_data))
-
-        var_corrected = np.var(corrected_data, axis=1)
-        var_reference = np.var(ref_data, axis=1)
+        var_corrected = np.concatenate(corrected_variances)
+        var_reference = np.concatenate(reference_variances)
 
         # Residual variance is the difference; clamped to avoid division by zero.
         var_residual = np.maximum(var_corrected - var_reference, 1e-10)
@@ -1064,7 +1131,10 @@ class SNRCalculator(Processor, ReferenceDataMixin):
         metrics["snr_per_channel"] = snr_per_channel.tolist()
 
         # --- RETURN ---
-        return context.with_metadata(new_metadata)
+        return context.with_metadata(
+            new_metadata,
+            copy_estimated_noise=False,
+        )
 
 
 @register_processor
@@ -1084,6 +1154,9 @@ class RMSResidualCalculator(Processor, ReferenceDataMixin):
     ----------
     time_buffer : float, optional
         Time buffer around acquisition window in seconds (default: 0.1).
+    channel_block_size : int or None, optional
+        Number of EEG channels loaded at once. ``None`` restores the legacy
+        all-channel allocation (default: 8).
     """
 
     name = "rms_residual_calculator"
@@ -1095,9 +1168,15 @@ class RMSResidualCalculator(Processor, ReferenceDataMixin):
     modifies_raw = False
     parallel_safe = False
 
-    def __init__(self, time_buffer: float = 0.1, verbose: bool = False) -> None:
+    def __init__(
+        self,
+        time_buffer: float = 0.1,
+        verbose: bool = False,
+        channel_block_size: int | None = DEFAULT_CHANNEL_BLOCK_SIZE,
+    ) -> None:
         self.time_buffer = time_buffer
         self.verbose = verbose
+        self.channel_block_size = _validate_channel_block_size(channel_block_size)
         super().__init__()
 
     def process(self, context: ProcessingContext) -> ProcessingContext:
@@ -1112,26 +1191,47 @@ class RMSResidualCalculator(Processor, ReferenceDataMixin):
         logger.info("Calculating RMS Residual Ratio (corrected vs reference)")
 
         # --- COMPUTE ---
-        ref_data = self.get_reference_data(raw, triggers, artifact_length, self.time_buffer, context=context)
-        corrected_data = self.get_acquisition_data(raw, triggers, artifact_length, context=context)
+        corrected_stds: list[np.ndarray] = []
+        reference_stds: list[np.ndarray] = []
+        for block_index, block in enumerate(
+            _iter_channel_blocks(eeg_picks, self.channel_block_size),
+            start=1,
+        ):
+            ref_data = self.get_reference_data(
+                raw,
+                triggers,
+                artifact_length,
+                self.time_buffer,
+                context=context,
+                picks=block,
+            )
+            corrected_data = self.get_acquisition_data(
+                raw,
+                triggers,
+                artifact_length,
+                context=context,
+                picks=block,
+            )
+            if ref_data.size == 0 or corrected_data.size == 0:
+                logger.warning("Insufficient data for RMS Residual calculation")
+                return context
+            if self.verbose:
+                logger.info(
+                    "RMS Residual diagnostics block {}: reference {}; corrected {}",
+                    block_index,
+                    _signal_summary(ref_data),
+                    _signal_summary(corrected_data),
+                )
+            reference_stds.append(np.std(ref_data, axis=1))
+            corrected_stds.append(np.std(corrected_data, axis=1))
 
-        if ref_data.size == 0 or corrected_data.size == 0:
+        if not reference_stds:
             logger.warning("Insufficient data for RMS Residual calculation")
             return context
 
-        if self.verbose:
-            logger.info(
-                "RMS Residual diagnostics: triggers={}, artifact_length={}, time_buffer={:.3f}s",
-                0 if triggers is None else len(triggers),
-                artifact_length,
-                self.time_buffer,
-            )
-            logger.info("RMS Residual diagnostics: reference {}", _signal_summary(ref_data))
-            logger.info("RMS Residual diagnostics: corrected {}", _signal_summary(corrected_data))
-
-        rms_corrected = np.std(corrected_data, axis=1)
+        rms_corrected = np.concatenate(corrected_stds)
         # Clamp to avoid division by zero.
-        rms_reference = np.maximum(np.std(ref_data, axis=1), 1e-10)
+        rms_reference = np.maximum(np.concatenate(reference_stds), 1e-10)
 
         ratio_per_channel = rms_corrected / rms_reference
         ratio_mean = np.mean(ratio_per_channel)
@@ -1153,7 +1253,10 @@ class RMSResidualCalculator(Processor, ReferenceDataMixin):
         metrics["rms_residual_per_channel"] = ratio_per_channel.tolist()
 
         # --- RETURN ---
-        return context.with_metadata(new_metadata)
+        return context.with_metadata(
+            new_metadata,
+            copy_estimated_noise=False,
+        )
 
 
 @register_processor
@@ -1162,6 +1265,9 @@ class LegacySNRCalculator(Processor):
 
     Mirrors the original FACET implementation by comparing the variance of the
     corrected data to the variance of the uncorrected reference recording.
+
+    ``channel_block_size`` controls how many EEG channels are materialized at
+    once; it defaults to 8 and does not change the per-channel calculation.
     """
 
     name = "legacy_snr_calculator"
@@ -1173,8 +1279,13 @@ class LegacySNRCalculator(Processor):
     modifies_raw = False
     parallel_safe = False
 
-    def __init__(self, verbose: bool = False) -> None:
+    def __init__(
+        self,
+        verbose: bool = False,
+        channel_block_size: int | None = DEFAULT_CHANNEL_BLOCK_SIZE,
+    ) -> None:
         self.verbose = verbose
+        self.channel_block_size = _validate_channel_block_size(channel_block_size)
         super().__init__()
 
     def validate(self, context: ProcessingContext) -> None:
@@ -1211,29 +1322,39 @@ class LegacySNRCalculator(Processor):
         acq_tmin = acq_start / sfreq
         acq_tmax = min(acq_end / sfreq, raw_corrected.times[-1])
 
-        corrected_data = raw_corrected.get_data(picks=picks, tmin=acq_tmin, tmax=acq_tmax)
-
-        ref_segments = []
-        if acq_tmin > 0:
-            ref_segments.append(raw_original.get_data(picks=picks, tmax=acq_tmin))
-        if acq_tmax < raw_original.times[-1]:
-            ref_segments.append(raw_original.get_data(picks=picks, tmin=acq_tmax))
-
-        reference_data = np.concatenate(ref_segments, axis=1) if ref_segments else raw_original.get_data(picks=picks)
-
-        if self.verbose:
-            logger.info(
-                "Legacy SNR diagnostics: triggers={}, artifact_length={}, acq=[{:.3f}, {:.3f}]s",
-                len(triggers),
-                artifact_length,
-                acq_tmin,
-                acq_tmax,
+        corrected_variances: list[np.ndarray] = []
+        reference_variances: list[np.ndarray] = []
+        for block_index, block in enumerate(
+            _iter_channel_blocks(picks, self.channel_block_size),
+            start=1,
+        ):
+            corrected_data = raw_corrected.get_data(
+                picks=block,
+                tmin=acq_tmin,
+                tmax=acq_tmax,
             )
-            logger.info("Legacy SNR diagnostics: corrected {}", _signal_summary(corrected_data))
-            logger.info("Legacy SNR diagnostics: reference {}", _signal_summary(reference_data))
 
-        var_corrected = np.var(corrected_data, axis=1)
-        var_reference = np.var(reference_data, axis=1)
+            ref_segments = []
+            if acq_tmin > 0:
+                ref_segments.append(raw_original.get_data(picks=block, tmax=acq_tmin))
+            if acq_tmax < raw_original.times[-1]:
+                ref_segments.append(raw_original.get_data(picks=block, tmin=acq_tmax))
+            reference_data = (
+                np.concatenate(ref_segments, axis=1) if ref_segments else raw_original.get_data(picks=block)
+            )
+
+            if self.verbose:
+                logger.info(
+                    "Legacy SNR diagnostics block {}: corrected {}; reference {}",
+                    block_index,
+                    _signal_summary(corrected_data),
+                    _signal_summary(reference_data),
+                )
+            corrected_variances.append(np.var(corrected_data, axis=1))
+            reference_variances.append(np.var(reference_data, axis=1))
+
+        var_corrected = np.concatenate(corrected_variances)
+        var_reference = np.concatenate(reference_variances)
 
         var_residual = np.maximum(var_corrected - var_reference, 1e-10)
 
@@ -1263,7 +1384,10 @@ class LegacySNRCalculator(Processor):
         metrics["legacy_snr_per_channel"] = snr_per_channel.tolist()
 
         # --- RETURN ---
-        return context.with_metadata(new_metadata)
+        return context.with_metadata(
+            new_metadata,
+            copy_estimated_noise=False,
+        )
 
 
 @register_processor
@@ -1274,6 +1398,9 @@ class RMSCalculator(Processor):
     indicates better correction (more artifact removed).
 
     RMS_ratio = RMS(uncorrected) / RMS(corrected)
+
+    Signal windows are loaded in blocks of ``channel_block_size`` channels
+    (default: 8). Pass ``None`` to use one all-channel block.
 
     Examples
     --------
@@ -1293,8 +1420,13 @@ class RMSCalculator(Processor):
     modifies_raw = False
     parallel_safe = False
 
-    def __init__(self, verbose: bool = False) -> None:
+    def __init__(
+        self,
+        verbose: bool = False,
+        channel_block_size: int | None = DEFAULT_CHANNEL_BLOCK_SIZE,
+    ) -> None:
         self.verbose = verbose
+        self.channel_block_size = _validate_channel_block_size(channel_block_size)
         super().__init__()
 
     def validate(self, context: ProcessingContext) -> None:
@@ -1327,17 +1459,47 @@ class RMSCalculator(Processor):
         acq_tmin = acq_start / sfreq
         acq_tmax = min(acq_end / sfreq, raw.times[-1])
 
-        data_corrected = raw.get_data(picks=eeg_channels, tmin=acq_tmin, tmax=acq_tmax)
-        data_uncorrected = raw_orig.get_data(picks=eeg_channels, tmin=acq_tmin, tmax=acq_tmax)
+        corrected_rms_blocks: list[np.ndarray] = []
+        uncorrected_rms_blocks: list[np.ndarray] = []
+        for block_index, block in enumerate(
+            _iter_channel_blocks(eeg_channels, self.channel_block_size),
+            start=1,
+        ):
+            data_corrected = raw.get_data(
+                picks=block,
+                tmin=acq_tmin,
+                tmax=acq_tmax,
+            )
+            data_uncorrected = raw_orig.get_data(
+                picks=block,
+                tmin=acq_tmin,
+                tmax=acq_tmax,
+            )
 
-        if data_corrected.shape[0] != data_uncorrected.shape[0]:
-            min_channels = min(data_corrected.shape[0], data_uncorrected.shape[0])
-            data_corrected = data_corrected[:min_channels]
-            data_uncorrected = data_uncorrected[:min_channels]
+            if data_corrected.shape[0] != data_uncorrected.shape[0]:
+                min_channels = min(
+                    data_corrected.shape[0],
+                    data_uncorrected.shape[0],
+                )
+                data_corrected = data_corrected[:min_channels]
+                data_uncorrected = data_uncorrected[:min_channels]
 
-        rms_uncorrected = np.sqrt(np.mean(data_uncorrected**2, axis=1))
+            if self.verbose:
+                logger.info(
+                    "RMS diagnostics block {}: uncorrected {}; corrected {}",
+                    block_index,
+                    _signal_summary(data_uncorrected),
+                    _signal_summary(data_corrected),
+                )
+            uncorrected_rms_blocks.append(np.sqrt(np.mean(data_uncorrected**2, axis=1)))
+            corrected_rms_blocks.append(np.sqrt(np.mean(data_corrected**2, axis=1)))
+
+        rms_uncorrected = np.concatenate(uncorrected_rms_blocks)
         # Clamp corrected RMS to avoid division by zero.
-        rms_corrected = np.maximum(np.sqrt(np.mean(data_corrected**2, axis=1)), 1e-10)
+        rms_corrected = np.maximum(
+            np.concatenate(corrected_rms_blocks),
+            1e-10,
+        )
 
         rms_ratio_per_channel = rms_uncorrected / rms_corrected
         rms_ratio = np.median(rms_ratio_per_channel)
@@ -1350,8 +1512,6 @@ class RMSCalculator(Processor):
                 acq_tmin,
                 acq_tmax,
             )
-            logger.info("RMS diagnostics: uncorrected {}", _signal_summary(data_uncorrected))
-            logger.info("RMS diagnostics: corrected {}", _signal_summary(data_corrected))
             logger.info("RMS diagnostics: rms_uncorrected {}", _dist_summary(rms_uncorrected))
             logger.info("RMS diagnostics: rms_corrected {}", _dist_summary(rms_corrected))
             logger.info("RMS diagnostics: ratio_per_channel {}", _dist_summary(rms_ratio_per_channel))
@@ -1368,7 +1528,10 @@ class RMSCalculator(Processor):
         metrics["rms_ratio_per_channel"] = rms_ratio_per_channel.tolist()
 
         # --- RETURN ---
-        return context.with_metadata(new_metadata)
+        return context.with_metadata(
+            new_metadata,
+            copy_estimated_noise=False,
+        )
 
 
 @register_processor
@@ -1380,6 +1543,9 @@ class MedianArtifactCalculator(Processor, ReferenceDataMixin):
 
     Also calculates the ratio to the median amplitude of the reference signal
     (outside acquisition), which should ideally be close to 1.0.
+
+    Signal epochs are loaded in blocks of ``channel_block_size`` channels
+    (default: 8), while the same global channel/epoch medians are retained.
 
     Examples
     --------
@@ -1399,8 +1565,13 @@ class MedianArtifactCalculator(Processor, ReferenceDataMixin):
     modifies_raw = False
     parallel_safe = False
 
-    def __init__(self, verbose: bool = False) -> None:
+    def __init__(
+        self,
+        verbose: bool = False,
+        channel_block_size: int | None = DEFAULT_CHANNEL_BLOCK_SIZE,
+    ) -> None:
         self.verbose = verbose
+        self.channel_block_size = _validate_channel_block_size(channel_block_size)
         super().__init__()
 
     def validate(self, context: ProcessingContext) -> None:
@@ -1468,7 +1639,10 @@ class MedianArtifactCalculator(Processor, ReferenceDataMixin):
             metrics["median_artifact_ratio"] = float(ratio)
 
         # --- RETURN ---
-        return context.with_metadata(new_metadata)
+        return context.with_metadata(
+            new_metadata,
+            copy_estimated_noise=False,
+        )
 
     def _compute_median_metrics(
         self,
@@ -1488,38 +1662,70 @@ class MedianArtifactCalculator(Processor, ReferenceDataMixin):
         """
         offset_samples = int(round(context.metadata.artifact_to_trigger_offset * sfreq))
 
-        p2p_per_epoch = []
+        p2p_per_epoch: list[np.ndarray] = []
         for t in triggers:
             start = t + offset_samples
             end = start + artifact_len
             if start >= 0 and end <= raw.n_times:
-                epoch_data = raw.get_data(picks=eeg_channels, start=start, stop=end)
-                p2p_per_epoch.append(np.ptp(epoch_data, axis=1))
+                channel_values = []
+                for block in _iter_channel_blocks(
+                    eeg_channels,
+                    self.channel_block_size,
+                ):
+                    epoch_data = raw.get_data(
+                        picks=block,
+                        start=start,
+                        stop=end,
+                    )
+                    channel_values.append(np.ptp(epoch_data, axis=1))
+                p2p_per_epoch.append(np.concatenate(channel_values))
         mean_p2p_per_epoch = [np.mean(epoch_p2p) for epoch_p2p in p2p_per_epoch]
         median_artifact = np.median(mean_p2p_per_epoch)
-
-        ref_data = self.get_reference_data(raw, triggers, artifact_len, context=context)
 
         median_ref = np.nan
         ratio = np.nan
 
-        if ref_data.size > 0:
-            n_samples_ref = ref_data.shape[1]
-            epoch_len = int(artifact_len)
-            n_ref_epochs = n_samples_ref // epoch_len
+        reference_p2p_blocks: list[np.ndarray] = []
+        n_ref_epochs: int | None = None
+        epoch_len = int(artifact_len)
+        for block in _iter_channel_blocks(
+            eeg_channels,
+            self.channel_block_size,
+        ):
+            ref_data = self.get_reference_data(
+                raw,
+                triggers,
+                artifact_len,
+                context=context,
+                picks=block,
+            )
+            if ref_data.size == 0:
+                reference_p2p_blocks = []
+                break
 
-            if n_ref_epochs > 0:
-                ref_data_truncated = ref_data[:, : n_ref_epochs * epoch_len]
-                # Reshape to (n_epochs, channels, samples) for per-epoch peak-to-peak.
-                ref_epochs = ref_data_truncated.reshape(len(eeg_channels), n_ref_epochs, epoch_len)
-                ref_epochs = np.moveaxis(ref_epochs, 1, 0)
+            block_ref_epochs = ref_data.shape[1] // epoch_len
+            n_ref_epochs = block_ref_epochs if n_ref_epochs is None else min(n_ref_epochs, block_ref_epochs)
+            if n_ref_epochs == 0:
+                reference_p2p_blocks = []
+                break
 
-                p2p_ref = [np.ptp(epoch, axis=1) for epoch in ref_epochs]
-                mean_p2p_ref = [np.mean(epoch_p2p) for epoch_p2p in p2p_ref]
-                median_ref = np.median(mean_p2p_ref)
+            truncated = ref_data[:, : n_ref_epochs * epoch_len]
+            reshaped = truncated.reshape(
+                len(block),
+                n_ref_epochs,
+                epoch_len,
+            )
+            reference_p2p_blocks.append(np.ptp(reshaped, axis=2).T)
 
-                if median_ref > 0:
-                    ratio = median_artifact / median_ref
+        if reference_p2p_blocks and n_ref_epochs:
+            # Keep only one peak-to-peak scalar per epoch/channel. Concatenating
+            # these small arrays in channel order preserves the legacy median.
+            p2p_ref = np.concatenate(reference_p2p_blocks, axis=1)
+            mean_p2p_ref = np.mean(p2p_ref, axis=1)
+            median_ref = np.median(mean_p2p_ref)
+
+            if median_ref > 0:
+                ratio = median_artifact / median_ref
 
         return median_artifact, median_ref, ratio
 
@@ -1537,6 +1743,9 @@ class FFTAllenCalculator(Processor, ReferenceDataMixin):
     Formula::
 
         metric = median(|Power_corr - Power_ref| / Power_ref) * 100
+
+    Welch spectra are calculated in blocks of ``channel_block_size`` channels
+    (default: 8) and reduced with the same global median.
     """
 
     name = "fft_allen_calculator"
@@ -1550,8 +1759,13 @@ class FFTAllenCalculator(Processor, ReferenceDataMixin):
 
     BANDS = [(0.8, 4, "Delta"), (4, 8, "Theta"), (8, 12, "Alpha"), (12, 24, "Beta")]
 
-    def __init__(self, verbose: bool = False) -> None:
+    def __init__(
+        self,
+        verbose: bool = False,
+        channel_block_size: int | None = DEFAULT_CHANNEL_BLOCK_SIZE,
+    ) -> None:
         self.verbose = verbose
+        self.channel_block_size = _validate_channel_block_size(channel_block_size)
         super().__init__()
 
     def process(self, context: ProcessingContext) -> ProcessingContext:
@@ -1566,41 +1780,86 @@ class FFTAllenCalculator(Processor, ReferenceDataMixin):
 
         # --- COMPUTE ---
         n_fft = int(3.0 * sfreq)  # 3-second segments as in MATLAB
-
-        ref_data = self.get_reference_data(raw, triggers, artifact_len, context=context)
-        corr_data = self.get_acquisition_data(raw, triggers, artifact_len, context=context)
-
-        if ref_data.size == 0 or corr_data.size == 0:
-            logger.warning("Insufficient data for FFT Allen")
+        eeg_picks = self.get_eeg_channels(raw)
+        if len(eeg_picks) == 0:
+            logger.warning("No EEG channels found for FFT Allen")
             return context
 
-        nperseg = min(n_fft, ref_data.shape[1], corr_data.shape[1])
+        band_values: dict[str, list[np.ndarray]] = {name: [] for _, _, name in self.BANDS}
+        for block_index, block in enumerate(
+            _iter_channel_blocks(eeg_picks, self.channel_block_size),
+            start=1,
+        ):
+            ref_data = self.get_reference_data(
+                raw,
+                triggers,
+                artifact_len,
+                context=context,
+                picks=block,
+            )
+            corr_data = self.get_acquisition_data(
+                raw,
+                triggers,
+                artifact_len,
+                context=context,
+                picks=block,
+            )
+            if ref_data.size == 0 or corr_data.size == 0:
+                logger.warning("Insufficient data for FFT Allen")
+                return context
+
+            nperseg = min(n_fft, ref_data.shape[1], corr_data.shape[1])
+            if self.verbose:
+                logger.info(
+                    "FFT Allen diagnostics block {}: nperseg={}, reference {}; corrected {}",
+                    block_index,
+                    nperseg,
+                    _signal_summary(ref_data),
+                    _signal_summary(corr_data),
+                )
+
+            freqs_ref, psd_ref = signal.welch(
+                ref_data,
+                fs=sfreq,
+                nperseg=nperseg,
+                axis=1,
+            )
+            freqs_corr, psd_corr = signal.welch(
+                corr_data,
+                fs=sfreq,
+                nperseg=nperseg,
+                axis=1,
+            )
+            if not np.array_equal(freqs_ref, freqs_corr):
+                logger.warning("Frequency mismatch in FFT Allen")
+                return context
+
+            for band_name, values in self._compute_band_difference_values(
+                freqs_ref,
+                psd_ref,
+                psd_corr,
+            ).items():
+                band_values[band_name].append(values)
+
+        results = {band_name: float(np.median(np.concatenate(values))) for band_name, values in band_values.items()}
 
         if self.verbose:
-            logger.info(
-                "FFT Allen diagnostics: sfreq={:.3f}, n_fft={}, nperseg={}",
-                sfreq,
-                n_fft,
-                nperseg,
-            )
-            logger.info("FFT Allen diagnostics: reference {}", _signal_summary(ref_data))
-            logger.info("FFT Allen diagnostics: corrected {}", _signal_summary(corr_data))
-
-        freqs_ref, psd_ref = signal.welch(ref_data, fs=sfreq, nperseg=nperseg, axis=1)
-        freqs_corr, psd_corr = signal.welch(corr_data, fs=sfreq, nperseg=nperseg, axis=1)
-
-        if not np.array_equal(freqs_ref, freqs_corr):
-            logger.warning("Frequency mismatch in FFT Allen")
-            return context
-
-        results = self._compute_band_differences(freqs_ref, psd_ref, psd_corr, verbose=self.verbose)
+            for band_name, values in band_values.items():
+                logger.info(
+                    "FFT Allen diagnostics: {} diff_pct [{}]",
+                    band_name,
+                    _dist_summary(np.concatenate(values)),
+                )
 
         # --- BUILD RESULT ---
         new_metadata = context.metadata.copy()
         new_metadata.custom.setdefault("metrics", {})["fft_allen"] = results
 
         # --- RETURN ---
-        return context.with_metadata(new_metadata)
+        return context.with_metadata(
+            new_metadata,
+            copy_estimated_noise=False,
+        )
 
     def _compute_band_differences(
         self,
@@ -1625,32 +1884,42 @@ class FFTAllenCalculator(Processor, ReferenceDataMixin):
         dict
             Band name → median percent difference.
         """
-        results: dict[str, float] = {}
+        values_by_band = self._compute_band_difference_values(
+            freqs,
+            psd_ref,
+            psd_corr,
+        )
+        results = {band_name: float(np.median(diff_pct)) for band_name, diff_pct in values_by_band.items()}
 
         for fmin, fmax, band_name in self.BANDS:
-            idx = np.logical_and(freqs >= fmin, freqs <= fmax)
-
-            power_ref = np.mean(psd_ref[:, idx], axis=1)
-            power_corr = np.mean(psd_corr[:, idx], axis=1)
-
-            diff_pct = np.abs(power_corr - power_ref) / (power_ref + 1e-10) * 100
-            median_diff = np.median(diff_pct)
-
-            results[band_name] = float(median_diff)
-
+            diff_pct = values_by_band[band_name]
+            median_diff = results[band_name]
             if verbose:
                 logger.info(
-                    "FFT Allen diagnostics: {} ({}-{}Hz) power_ref [{}], power_corr [{}], diff_pct [{}]",
+                    "FFT Allen diagnostics: {} ({}-{}Hz) diff_pct [{}]",
                     band_name,
                     fmin,
                     fmax,
-                    _dist_summary(power_ref),
-                    _dist_summary(power_corr),
                     _dist_summary(diff_pct),
                 )
             logger.debug("FFT Allen {} ({}-{}Hz): {:.2f}%", band_name, fmin, fmax, median_diff)
 
         return results
+
+    def _compute_band_difference_values(
+        self,
+        freqs: np.ndarray,
+        psd_ref: np.ndarray,
+        psd_corr: np.ndarray,
+    ) -> dict[str, np.ndarray]:
+        """Return per-channel Allen differences for block-wise aggregation."""
+        values: dict[str, np.ndarray] = {}
+        for fmin, fmax, band_name in self.BANDS:
+            idx = np.logical_and(freqs >= fmin, freqs <= fmax)
+            power_ref = np.mean(psd_ref[:, idx], axis=1)
+            power_corr = np.mean(psd_corr[:, idx], axis=1)
+            values[band_name] = np.abs(power_corr - power_ref) / (power_ref + 1e-10) * 100
+        return values
 
 
 @register_processor
@@ -1660,6 +1929,9 @@ class FFTNiazyCalculator(Processor, ReferenceDataMixin):
     Analyzes residual artifacts at slice and volume frequencies by computing
     the power ratio (uncorrected / corrected) at these frequencies and their
     harmonics. Values are reported in dB.
+
+    Welch spectra are calculated in blocks of ``channel_block_size`` channels
+    (default: 8) and reduced with the same global channel medians.
     """
 
     name = "fft_niazy_calculator"
@@ -1671,8 +1943,13 @@ class FFTNiazyCalculator(Processor, ReferenceDataMixin):
     modifies_raw = False
     parallel_safe = False
 
-    def __init__(self, verbose: bool = False) -> None:
+    def __init__(
+        self,
+        verbose: bool = False,
+        channel_block_size: int | None = DEFAULT_CHANNEL_BLOCK_SIZE,
+    ) -> None:
         self.verbose = verbose
+        self.channel_block_size = _validate_channel_block_size(channel_block_size)
         super().__init__()
 
     def process(self, context: ProcessingContext) -> ProcessingContext:
@@ -1693,30 +1970,87 @@ class FFTNiazyCalculator(Processor, ReferenceDataMixin):
 
         slice_freq, vol_freq = self._estimate_frequencies(triggers, sfreq, context)
 
-        data_corr = self.get_acquisition_data(raw, triggers, artifact_len, context=context)
-        data_orig = self.get_acquisition_data(raw_orig, triggers, artifact_len, context=context)
+        corrected_picks = self.get_eeg_channels(raw)
+        original_picks = self.get_eeg_channels(raw_orig)
+        n_channels = min(len(corrected_picks), len(original_picks))
+        if n_channels == 0:
+            logger.warning("No common EEG channels found for FFT Niazy")
+            return context
+        corrected_picks = corrected_picks[:n_channels]
+        original_picks = original_picks[:n_channels]
 
-        min_ch = min(data_corr.shape[0], data_orig.shape[0])
-        data_corr = data_corr[:min_ch]
-        data_orig = data_orig[:min_ch]
+        harmonic_powers: dict[
+            str,
+            dict[str, dict[str, list[np.ndarray]]],
+        ] = {"slice": {}, "volume": {}}
+        fundamentals = {"slice": slice_freq}
+        if vol_freq is not None:
+            fundamentals["volume"] = vol_freq
+        for kind in fundamentals:
+            harmonic_powers[kind] = {f"h{harmonic}": {"corrected": [], "original": []} for harmonic in range(1, 6)}
 
-        nperseg = min(int(4 * sfreq), data_corr.shape[1])
-
-        if self.verbose:
-            logger.info(
-                "FFT Niazy diagnostics: sfreq={:.3f}, slice_freq={:.3f}Hz, vol_freq={}, nperseg={}",
-                sfreq,
-                slice_freq,
-                "none" if vol_freq is None else f"{vol_freq:.3f}Hz",
-                nperseg,
+        block_size = n_channels if self.channel_block_size is None else self.channel_block_size
+        for block_index, start in enumerate(
+            range(0, n_channels, block_size),
+            start=1,
+        ):
+            stop = min(start + block_size, n_channels)
+            data_corr = self.get_acquisition_data(
+                raw,
+                triggers,
+                artifact_len,
+                context=context,
+                picks=corrected_picks[start:stop],
             )
-            logger.info("FFT Niazy diagnostics: corrected {}", _signal_summary(data_corr))
-            logger.info("FFT Niazy diagnostics: original {}", _signal_summary(data_orig))
+            data_orig = self.get_acquisition_data(
+                raw_orig,
+                triggers,
+                artifact_len,
+                context=context,
+                picks=original_picks[start:stop],
+            )
+            min_ch = min(data_corr.shape[0], data_orig.shape[0])
+            data_corr = data_corr[:min_ch]
+            data_orig = data_orig[:min_ch]
+            if data_corr.size == 0 or data_orig.size == 0:
+                logger.warning("Insufficient data for FFT Niazy")
+                return context
 
-        freqs, psd_corr = signal.welch(data_corr, fs=sfreq, nperseg=nperseg, axis=1)
-        _, psd_orig = signal.welch(data_orig, fs=sfreq, nperseg=nperseg, axis=1)
+            nperseg = min(int(4 * sfreq), data_corr.shape[1])
+            if self.verbose:
+                logger.info(
+                    "FFT Niazy diagnostics block {}: nperseg={}, corrected {}; original {}",
+                    block_index,
+                    nperseg,
+                    _signal_summary(data_corr),
+                    _signal_summary(data_orig),
+                )
 
-        results = self._compute_harmonic_ratios(freqs, psd_corr, psd_orig, slice_freq, vol_freq, verbose=self.verbose)
+            freqs, psd_corr = signal.welch(
+                data_corr,
+                fs=sfreq,
+                nperseg=nperseg,
+                axis=1,
+            )
+            _, psd_orig = signal.welch(
+                data_orig,
+                fs=sfreq,
+                nperseg=nperseg,
+                axis=1,
+            )
+            self._append_harmonic_powers(
+                harmonic_powers,
+                freqs,
+                psd_corr,
+                psd_orig,
+                fundamentals,
+            )
+
+        results = self._ratios_from_harmonic_powers(
+            harmonic_powers,
+            fundamentals,
+            verbose=self.verbose,
+        )
 
         slice_h1 = results["slice"].get("h1", float("nan"))
         if not np.isnan(slice_h1):
@@ -1727,7 +2061,10 @@ class FFTNiazyCalculator(Processor, ReferenceDataMixin):
         new_metadata.custom.setdefault("metrics", {})["fft_niazy"] = results
 
         # --- RETURN ---
-        return context.with_metadata(new_metadata)
+        return context.with_metadata(
+            new_metadata,
+            copy_estimated_noise=False,
+        )
 
     def _estimate_frequencies(
         self,
@@ -1829,6 +2166,63 @@ class FFTNiazyCalculator(Processor, ReferenceDataMixin):
                             ratio_db,
                         )
 
+        return results
+
+    @staticmethod
+    def _append_harmonic_powers(
+        target: dict[str, dict[str, dict[str, list[np.ndarray]]]],
+        freqs: np.ndarray,
+        psd_corr: np.ndarray,
+        psd_orig: np.ndarray,
+        fundamentals: dict[str, float],
+        *,
+        harmonics: int = 5,
+        tolerance: float = 0.5,
+    ) -> None:
+        """Append per-channel harmonic powers from one channel block."""
+        for kind, fundamental in fundamentals.items():
+            for harmonic in range(1, harmonics + 1):
+                frequency = fundamental * harmonic
+                idx = np.logical_and(
+                    freqs >= frequency - tolerance,
+                    freqs <= frequency + tolerance,
+                )
+                if not np.any(idx):
+                    continue
+                key = f"h{harmonic}"
+                target[kind][key]["corrected"].append(np.mean(psd_corr[:, idx], axis=1))
+                target[kind][key]["original"].append(np.mean(psd_orig[:, idx], axis=1))
+
+    @staticmethod
+    def _ratios_from_harmonic_powers(
+        powers: dict[str, dict[str, dict[str, list[np.ndarray]]]],
+        fundamentals: dict[str, float],
+        *,
+        verbose: bool = False,
+    ) -> dict[str, Any]:
+        """Reduce block-wise per-channel powers using the legacy medians."""
+        results: dict[str, Any] = {"slice": {}, "volume": {}}
+        for kind, fundamental in fundamentals.items():
+            for key, values in powers[kind].items():
+                if not values["corrected"] or not values["original"]:
+                    continue
+                corrected = np.concatenate(values["corrected"])
+                original = np.concatenate(values["original"])
+                p_corr = np.median(corrected)
+                if p_corr <= 0:
+                    continue
+                p_orig = np.median(original)
+                ratio = float(10 * np.log10(p_orig / p_corr))
+                results[kind][key] = ratio
+                if verbose:
+                    harmonic = int(key[1:])
+                    logger.info(
+                        "FFT Niazy diagnostics: {} {} @ {:.3f}Hz ratio={:.2f} dB",
+                        kind,
+                        key,
+                        fundamental * harmonic,
+                        ratio,
+                    )
         return results
 
 

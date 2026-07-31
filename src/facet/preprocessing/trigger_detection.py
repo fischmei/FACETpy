@@ -103,10 +103,19 @@ class TriggerDetector(Processor):
                     description=["Trigger"] * len(triggers),
                 )
             )
-            return context.with_raw(raw_copy).with_metadata(new_metadata)
+            return context.with_raw(
+                raw_copy,
+                copy_estimated_noise=False,
+            ).with_metadata(
+                new_metadata,
+                copy_estimated_noise=False,
+            )
 
         # --- RETURN ---
-        return context.with_metadata(new_metadata)
+        return context.with_metadata(
+            new_metadata,
+            copy_estimated_noise=False,
+        )
 
     def _find_events(self, raw: mne.io.Raw) -> list:
         """Search stim channels then annotations for matching events.
@@ -259,9 +268,7 @@ class TriggerDetector(Processor):
         events = [[int(sample + raw.first_samp), 0, event_value] for sample in rising_edges]
         channel_name = raw.ch_names[channel_idx]
         score = (
-            int(self._has_trigger_name_hint(channel_name)) * 1000
-            + int(bool(matched_values)) * 100
-            - len(unique_values)
+            int(self._has_trigger_name_hint(channel_name)) * 1000 + int(bool(matched_values)) * 100 - len(unique_values)
         )
         return {
             "channel_name": channel_name,
@@ -473,10 +480,19 @@ class QRSTriggerDetector(Processor):
                     description=["QRS"] * len(triggers),
                 )
             )
-            return context.with_raw(raw_copy).with_metadata(new_metadata)
+            return context.with_raw(
+                raw_copy,
+                copy_estimated_noise=False,
+            ).with_metadata(
+                new_metadata,
+                copy_estimated_noise=False,
+            )
 
         # --- RETURN ---
-        return context.with_metadata(new_metadata)
+        return context.with_metadata(
+            new_metadata,
+            copy_estimated_noise=False,
+        )
 
 
 @register_processor
@@ -562,7 +578,10 @@ class MissingTriggerDetector(Processor):
         new_metadata.custom["missing_triggers"] = missing_triggers
 
         # --- RETURN ---
-        return context.with_metadata(new_metadata)
+        return context.with_metadata(
+            new_metadata,
+            copy_estimated_noise=False,
+        )
 
     def _build_template(
         self,
@@ -701,7 +720,13 @@ class MissingTriggerDetector(Processor):
             description=list(existing_annot.description) + list(new_annot.description),
         )
         raw_copy.set_annotations(combined)
-        return context.with_raw(raw_copy).with_metadata(new_metadata)
+        return context.with_raw(
+            raw_copy,
+            copy_estimated_noise=False,
+        ).with_metadata(
+            new_metadata,
+            copy_estimated_noise=False,
+        )
 
     def _align_to_template(
         self,
@@ -871,10 +896,16 @@ class MissingTriggerCompleter(Processor):
         }
 
         if not self.add_to_context:
-            return context.with_metadata(metadata)
+            return context.with_metadata(
+                metadata,
+                copy_estimated_noise=False,
+            )
 
         metadata.triggers = completed
-        result = context.with_metadata(metadata)
+        result = context.with_metadata(
+            metadata,
+            copy_estimated_noise=False,
+        )
 
         if self.add_annotations and context.has_raw() and len(inserted) > 0:
             raw = context.get_raw().copy()
@@ -891,7 +922,10 @@ class MissingTriggerCompleter(Processor):
                 description=list(existing.description) + list(extra.description),
             )
             raw.set_annotations(merged)
-            return result.with_raw(raw)
+            return result.with_raw(
+                raw,
+                copy_estimated_noise=False,
+            )
 
         # --- RETURN ---
         return result
@@ -1054,7 +1088,10 @@ class SliceTriggerGenerator(Processor):
             "num_generated_triggers": int(len(generated)),
         }
 
-        result = context.with_metadata(metadata)
+        result = context.with_metadata(
+            metadata,
+            copy_estimated_noise=False,
+        )
 
         if self.add_annotations and context.has_raw():
             raw = context.get_raw().copy()
@@ -1066,7 +1103,10 @@ class SliceTriggerGenerator(Processor):
                     description=["generated_slice_trigger"] * len(generated),
                 )
             )
-            return result.with_raw(raw)
+            return result.with_raw(
+                raw,
+                copy_estimated_noise=False,
+            )
 
         return result
 

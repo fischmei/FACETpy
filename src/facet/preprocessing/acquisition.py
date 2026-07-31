@@ -180,7 +180,10 @@ class CutAcquisitionWindow(Processor):
         context.cache_set("acquisition_window", (acq_start, acq_end))
 
         # --- RETURN ---
-        return context.with_metadata(new_metadata)
+        return context.with_metadata(
+            new_metadata,
+            copy_estimated_noise=False,
+        )
 
 
 @register_processor
@@ -222,4 +225,7 @@ class PasteAcquisitionWindow(Processor):
         context.cache_clear()
 
         # --- RETURN ---
-        return context.with_metadata(metadata)
+        return context.with_metadata(
+            metadata,
+            copy_estimated_noise=False,
+        )

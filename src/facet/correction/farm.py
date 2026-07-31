@@ -6,14 +6,14 @@ import numpy as np
 from loguru import logger
 
 from ..core import ProcessingContext, ProcessorValidationError, register_processor
-from .aas import AASCorrection
+from .flex import Flex
 
 
 @register_processor
-class FARMCorrection(AASCorrection):
+class FARMCorrection(Flex):
     """Remove fMRI artifacts using the MATLAB FACET FARM weighting strategy.
 
-    This processor reuses the AAS subtraction pipeline but replaces template
+    This processor reuses the Flex template engine but replaces template
     selection with the FARM rule from MATLAB ``AvgArtWghtFARM``:
 
     - Compute epoch-to-epoch correlations for one channel.
@@ -25,6 +25,10 @@ class FARMCorrection(AASCorrection):
     ----------
     window_size : int
         Number of similar epochs to average (default: 30).
+    rel_window_position : float
+        Shared AAS/FARM tuning parameter accepted for API parity. FARM keeps
+        its row-wise candidate selection strategy, so this value is stored and
+        validated like AAS but does not alter FARM weighting.
     correlation_threshold : float
         Minimum absolute correlation for candidate selection
         (default: 0.9, matching MATLAB FARM).
@@ -32,7 +36,9 @@ class FARMCorrection(AASCorrection):
         Half-window in epochs used for candidate search. If ``None``, derived
         from ``search_half_window_factor * window_size``.
     search_half_window_factor : float
-        Multiplier used when ``search_half_window`` is not set (default: 3.0).
+        # Legacy compatibility multiplier retained for API parity. FARM no
+        # longer expands the candidate search span with this value; the search
+        # neighborhood is capped by the averaging window size instead.
     plot_artifacts : bool
         If ``True``, plot one random averaged artifact (default: False).
     realign_after_averaging : bool
@@ -62,28 +68,74 @@ class FARMCorrection(AASCorrection):
         search_window_factor: float = 3.0,
         interpolate_volume_gaps: bool = False,
         apply_epoch_alpha_scaling: bool = False,
+        track_estimated_noise: bool = True,
+        *,
+        rel_window_position: float = 0.0,
     ) -> None:
+        # These legacy names remain public because existing pipelines, reports,
+        # and the grid search configure FARM through the AAS-compatible API.
+        # Flex consults the matrix hooks below instead of assuming its own
+        # future-first strategy arguments.
+        self.correlation_threshold = correlation_threshold
+        self.rel_window_position = rel_window_position
         self.search_half_window = search_half_window
         self.search_half_window_factor = search_half_window_factor
         super().__init__(
             window_size=window_size,
-            rel_window_position=0.0,
-            correlation_threshold=correlation_threshold,
+            threshold=correlation_threshold,
+            min_accepted=1,
+            N_distribution="equal",
             plot_artifacts=plot_artifacts,
             realign_after_averaging=realign_after_averaging,
             search_window_factor=search_window_factor,
             interpolate_volume_gaps=interpolate_volume_gaps,
             apply_epoch_alpha_scaling=apply_epoch_alpha_scaling,
+            track_estimated_noise=track_estimated_noise,
         )
 
-    def validate(self, context: ProcessingContext) -> None:
-        super().validate(context)
+    def _get_parameters(self) -> dict[str, object]:
+        """Return only arguments accepted by the FARM constructor.
+
+        Parallel workers recreate a processor with ``type(proc)(**params)``.
+        Flex's strategy-only controls therefore must not leak into FARM's
+        serialized public configuration.
+        """
+        return {
+            "window_size": self.window_size,
+            "correlation_threshold": self.correlation_threshold,
+            "search_half_window": self.search_half_window,
+            "search_half_window_factor": self.search_half_window_factor,
+            "plot_artifacts": self.plot_artifacts,
+            "realign_after_averaging": self.realign_after_averaging,
+            "search_window_factor": self.search_window_factor,
+            "interpolate_volume_gaps": self.interpolate_volume_gaps,
+            "apply_epoch_alpha_scaling": self.apply_epoch_alpha_scaling,
+            "track_estimated_noise": self.track_estimated_noise,
+            "rel_window_position": self.rel_window_position,
+        }
+
+    def _validate_averaging_strategy(self, context: ProcessingContext) -> None:
+        """Validate FARM-only settings without Flex selection constraints."""
+        del context
+
+        if not (0 < self.correlation_threshold <= 1):
+            raise ProcessorValidationError(f"correlation_threshold must be in (0, 1], got {self.correlation_threshold}")
+        if not (-1.0 <= self.rel_window_position <= 1.0):
+            raise ProcessorValidationError(f"rel_window_position must be in [-1, 1], got {self.rel_window_position}")
         if self.search_half_window is not None and self.search_half_window < 1:
             raise ProcessorValidationError(f"search_half_window must be >= 1 when set, got {self.search_half_window}")
         if self.search_half_window_factor <= 0:
             raise ProcessorValidationError(
                 f"search_half_window_factor must be positive, got {self.search_half_window_factor}"
             )
+
+    def _matrix_rel_window_offset(self) -> float:
+        """Return the legacy API value passed to the matrix strategy hook."""
+        return float(self.rel_window_position)
+
+    def _matrix_correlation_threshold(self) -> float:
+        """Return FARM's absolute-correlation cutoff for matrix construction."""
+        return float(self.correlation_threshold)
 
     def _calc_averaging_matrix(
         self,

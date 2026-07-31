@@ -9,6 +9,8 @@ Date: 2025-01-12
 
 from .aas import AASCorrection, AveragedArtifactSubtraction
 from .farm import FARMArtifactCorrection, FARMCorrection
+from .flex import Flex, FlexCorrection
+from .grid_search import CorrectionGridSearch, CorrectionGridSearchResult
 from .volume import RemoveVolumeArtifactCorrection, VolumeArtifactCorrection
 from .weighted import (
     AvgArtWghtCorrespondingSliceCorrection,
@@ -22,16 +24,22 @@ from .weighted import (
 )
 
 __all__ = [
-    # AAS
+    # Shared template-matrix engine
+    "Flex",
+    "FlexCorrection",
+    # Legacy matrix strategies
     "AASCorrection",
     "AveragedArtifactSubtraction",
-    # FARM
     "FARMCorrection",
     "FARMArtifactCorrection",
+    # Parameter search
+    "CorrectionGridSearch",
+    "CorrectionGridSearchResult",
+    # "CORRELATION_THRESHOLD_GRID",
     # Volume transitions
     "VolumeArtifactCorrection",
     "RemoveVolumeArtifactCorrection",
-    # AAS weighting variants
+    # Legacy structural and motion-weighted strategies
     "CorrespondingSliceCorrection",
     "VolumeTriggerCorrection",
     "SliceTriggerCorrection",

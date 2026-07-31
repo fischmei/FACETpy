@@ -1,0 +1,1060 @@
+"""Cached leave-one-dataset-out validation using Pipeline.run_chunked.
+
+Every Flex configuration is executed through the same trigger-section chunking
+engine used by quickstart. The runner never preloads a complete recording.
+Chunk outputs are temporary; only aggregated metrics and validation CSV files
+are retained. The global and per-fold reports include the complete parameter
+grid, normalized combination heatmaps, objective trade-off plots, held-out
+metric summaries, and parameter-selection stability.
+"""
+
+from __future__ import annotations
+
+import argparse
+import gc
+import hashlib
+import json
+import os
+import tempfile
+import time
+import traceback
+from collections import Counter
+from collections.abc import Iterable, Mapping
+from concurrent.futures import ProcessPoolExecutor, as_completed
+from pathlib import Path
+from typing import Any
+
+
+def release_process_memory() -> None:
+    """Run Python GC and return free glibc arenas to Linux when possible."""
+    gc.collect()
+    try:
+        import ctypes
+
+        libc = ctypes.CDLL("libc.so.6")
+        malloc_trim = getattr(libc, "malloc_trim", None)
+        if malloc_trim is not None:
+            malloc_trim(0)
+    except (OSError, AttributeError):
+        pass
+
+
+os.environ.setdefault("OMP_NUM_THREADS", "1")
+os.environ.setdefault("OPENBLAS_NUM_THREADS", "1")
+os.environ.setdefault("MKL_NUM_THREADS", "1")
+os.environ.setdefault("NUMEXPR_NUM_THREADS", "1")
+os.environ.setdefault("VECLIB_MAXIMUM_THREADS", "1")
+
+import numpy as np  # noqa: E402
+import pandas as pd  # noqa: E402
+from loguru import logger  # noqa: E402
+from matplotlib import pyplot as plt  # noqa: E402
+
+from facet.core import ProcessingContext  # noqa: E402
+from facet.correction.grid_search_pareto import (  # noqa: E402
+    FLEX_PARAMETER_NAMES,
+    CorrectionGridSearch,
+)
+
+
+def find_input_datasets(input_directory: Path, *, recursive: bool) -> list[Path]:
+    iterator = input_directory.rglob("*") if recursive else input_directory.glob("*")
+    datasets = sorted(
+        path
+        for path in iterator
+        if (path.suffix.lower() == ".edf" and path.is_file())
+        or (path.suffix.lower() == ".mff" and (path.is_dir() or path.is_file()))
+    )
+    if len(datasets) < 2:
+        raise ValueError("At least two .edf or .mff datasets are required.")
+    return datasets
+
+
+def unique_dataset_ids(paths: list[Path]) -> dict[str, Path]:
+    output: dict[str, Path] = {}
+    for path in paths:
+        candidate = path.stem
+        if candidate in output:
+            candidate = f"{path.parent.name}__{path.stem}"
+        base = candidate
+        suffix = 2
+        while candidate in output:
+            candidate = f"{base}__{suffix}"
+            suffix += 1
+        output[candidate] = path
+    return output
+
+
+def build_search(output_directory: Path, *, upsample_factor: int, prefix: str) -> CorrectionGridSearch:
+    output_directory.mkdir(parents=True, exist_ok=True)
+    return CorrectionGridSearch(
+        trigger_regex=r"\b1\b",
+        upsample_factor=upsample_factor,
+        output_csv=output_directory / f"{prefix}_grid_results.csv",
+        output_aggregate_csv=output_directory / f"{prefix}_grid_aggregate.csv",
+        output_parameter_effects_csv=output_directory / f"{prefix}_parameter_effects.csv",
+        output_pareto_csv=output_directory / f"{prefix}_pareto.csv",
+        output_combination_grid_csv=output_directory / f"{prefix}_combinations.csv",
+        output_pareto_2d=output_directory / f"{prefix}_pareto_2d.png",
+        output_pareto_3d=output_directory / f"{prefix}_pareto_3d.png",
+        output_pareto_matrix=output_directory / f"{prefix}_pareto_matrix.png",
+        output_combination_heatmap=output_directory / f"{prefix}_combination_heatmap.png",
+        output_parameter_effects_plot=output_directory / f"{prefix}_parameter_effects.png",
+        pareto_objectives={"snr": "max", "rms_residual": "min", "fft_niazy_*": "min"},
+        parameter_effect_metric="snr",
+        parameter_effect_direction="max",
+        continue_on_error=True,
+        show_progress=False,
+    )
+
+
+def write_json(path: Path, payload: dict[str, Any]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(payload, indent=2, sort_keys=True))
+
+
+def grid_signature(
+    search: CorrectionGridSearch,
+    dataset_paths: dict[str, Path],
+    upsample_factor: int,
+    *,
+    chunk_padding_seconds: float,
+    chunk_min_triggers: int,
+    chunk_gap_seconds: float | None,
+) -> str:
+    payload = {
+        "upsample_factor": upsample_factor,
+        "parameter_grid": search.iter_parameter_grid(),
+        "datasets": {key: str(value.resolve()) for key, value in dataset_paths.items()},
+        "chunking": {
+            "engine": "Pipeline.run_chunked",
+            "trigger_section_padding_seconds": chunk_padding_seconds,
+            "trigger_section_min_triggers": chunk_min_triggers,
+            "trigger_section_gap_seconds": chunk_gap_seconds,
+            "channel_sequential": True,
+        },
+    }
+    encoded = json.dumps(payload, sort_keys=True, default=str).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def _iter_result_items(chunked_result: Any) -> Iterable[Any]:
+    """Yield per-chunk results from all supported ChunkedPipelineResult APIs."""
+    for name in ("results", "chunk_results", "pipeline_results", "_results"):
+        value = getattr(chunked_result, name, None)
+        if value is not None:
+            if isinstance(value, Mapping):
+                yield from value.values()
+            else:
+                yield from value
+            return
+
+    # Current ChunkedPipelineResult is list-like, so iteration is a safe final
+    # fallback even when a named public result attribute is unavailable.
+    try:
+        yield from iter(chunked_result)
+        return
+    except TypeError as exc:
+        raise RuntimeError(
+            "ChunkedPipelineResult is neither iterable nor exposes a result collection."
+        ) from exc
+
+
+def _result_context(item: Any) -> ProcessingContext | None:
+    if isinstance(item, ProcessingContext):
+        return item
+    for name in ("context", "final_context", "result"):
+        value = getattr(item, name, None)
+        if isinstance(value, ProcessingContext):
+            return value
+    return None
+
+
+def _result_success(item: Any) -> bool:
+    value = getattr(item, "success", None)
+    if value is None:
+        return _result_context(item) is not None
+    return bool(value)
+
+
+def _result_error(item: Any) -> str:
+    value = getattr(item, "error", "")
+    return "" if value is None else str(value)
+
+
+def _result_execution_time(item: Any) -> float:
+    value = getattr(item, "execution_time", 0.0)
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def _chunk_weight(context: ProcessingContext) -> float:
+    """Return a weight without requiring Raw data to remain in memory."""
+    if context.has_triggers():
+        return float(max(len(context.get_triggers()), 1))
+
+    chunk = context.metadata.custom.get("chunk", {})
+    if isinstance(chunk, Mapping):
+        start = chunk.get("start_sample")
+        stop = chunk.get("stop_sample")
+        if isinstance(start, (int, np.integer)) and isinstance(stop, (int, np.integer)):
+            return float(max(int(stop) - int(start), 1))
+
+    return 1.0
+
+
+def _aggregate_chunk_metrics(
+    search: CorrectionGridSearch,
+    chunked_result: Any,
+) -> tuple[dict[str, float], int, int, float, list[str]]:
+    """Aggregate successful chunk metrics with trigger-count weighting."""
+    weighted_sums: dict[str, float] = {}
+    metric_weights: dict[str, float] = {}
+    errors: list[str] = []
+    successful_chunks = 0
+    total_chunks = 0
+    execution_time = 0.0
+
+    for item in _iter_result_items(chunked_result):
+        total_chunks += 1
+        execution_time += _result_execution_time(item)
+        if not _result_success(item):
+            errors.append(_result_error(item))
+            continue
+
+        context = _result_context(item)
+        if context is None:
+            errors.append("Successful chunk result did not retain its ProcessingContext.")
+            continue
+
+        successful_chunks += 1
+        weight = _chunk_weight(context)
+        raw_metrics = context.metadata.custom.get("metrics", {})
+        metrics = search._flatten_metrics(raw_metrics)
+        if not metrics:
+            errors.append(
+                "Chunk completed successfully but produced no metric metadata. "
+                "Verify that metric processors are present after DownSample."
+            )
+            continue
+        for name, value in metrics.items():
+            if np.isfinite(value):
+                weighted_sums[name] = weighted_sums.get(name, 0.0) + float(value) * weight
+                metric_weights[name] = metric_weights.get(name, 0.0) + weight
+
+    aggregated = {
+        name: weighted_sums[name] / metric_weights[name]
+        for name in weighted_sums
+        if metric_weights.get(name, 0.0) > 0.0
+    }
+    return aggregated, successful_chunks, total_chunks, execution_time, errors
+
+
+def evaluate_configuration_chunked(
+    search: CorrectionGridSearch,
+    input_path: Path,
+    dataset_id: str,
+    params: Mapping[str, Any],
+    *,
+    chunk_padding_seconds: float,
+    chunk_min_triggers: int,
+    chunk_gap_seconds: float | None,
+    combination_number: int | None = None,
+    combination_total: int | None = None,
+) -> dict[str, Any]:
+    """Execute one configuration exclusively through Pipeline.run_chunked."""
+    pipeline = search.build_pipeline(params)
+    started = time.perf_counter()
+    if combination_number is not None and combination_total is not None:
+        logger.info(
+            "Dataset '{}': running combination {}/{}: {}",
+            dataset_id,
+            combination_number,
+            combination_total,
+            dict(params),
+        )
+    else:
+        logger.info(
+            "Dataset '{}': running selected held-out combination: {}",
+            dataset_id,
+            dict(params),
+        )
+
+    try:
+        # run_chunked currently expects an output directory. A temporary
+        # directory preserves its existing quickstart behavior without keeping
+        # thousands of corrected grid-search EDF files.
+        with tempfile.TemporaryDirectory(prefix="facetpy_kfold_chunked_") as temporary:
+            result = pipeline.run_chunked(
+                input_path=str(input_path),
+                output_dir=temporary,
+                output_extension=".edf",
+                overwrite=True,
+                channel_sequential=True,
+                on_error="continue" if search.continue_on_error else "raise",
+                keep_raw=False,
+                chunk_by_trigger_sections=True,
+                trigger_section_padding_seconds=chunk_padding_seconds,
+                trigger_section_min_triggers=chunk_min_triggers,
+                trigger_section_gap_seconds=chunk_gap_seconds,
+            )
+            metrics, successful, total, chunk_time, errors = _aggregate_chunk_metrics(search, result)
+            # Chunk Raw objects have already been released by run_chunked.
+            # Drop the result container before leaving the temporary directory.
+            del result
+            release_process_memory()
+
+        success = total > 0 and successful == total and bool(metrics)
+        if total > 0 and successful > 0 and not metrics:
+            errors.append("No evaluation metrics were collected from any successful chunk.")
+        return {
+            "dataset_id": dataset_id,
+            "configuration_id": search._configuration_id(params),
+            **dict(params),
+            "success": success,
+            "execution_time": chunk_time or (time.perf_counter() - started),
+            "n_chunks": total,
+            "successful_chunks": successful,
+            "error": " | ".join(error for error in errors if error),
+            **metrics,
+        }
+    except Exception as exc:
+        if not search.continue_on_error:
+            raise
+        return {
+            "dataset_id": dataset_id,
+            "configuration_id": search._configuration_id(params),
+            **dict(params),
+            "success": False,
+            "execution_time": time.perf_counter() - started,
+            "n_chunks": 0,
+            "successful_chunks": 0,
+            "error": f"{type(exc).__name__}: {exc}",
+        }
+    finally:
+        release_process_memory()
+
+
+def evaluate_dataset_chunked(
+    search: CorrectionGridSearch,
+    input_path: Path,
+    dataset_id: str,
+    *,
+    chunk_padding_seconds: float,
+    chunk_min_triggers: int,
+    chunk_gap_seconds: float | None,
+    workers: int = 1,
+) -> list[dict[str, Any]]:
+    """Evaluate and log the complete grid for one dataset."""
+    grid = search.iter_parameter_grid()
+
+    if workers <= 1:
+        rows = []
+        for number, params in enumerate(grid, start=1):
+            rows.append(
+                evaluate_configuration_chunked(
+                    search,
+                    input_path,
+                    dataset_id,
+                    params,
+                    chunk_padding_seconds=chunk_padding_seconds,
+                    chunk_min_triggers=chunk_min_triggers,
+                    chunk_gap_seconds=chunk_gap_seconds,
+                    combination_number=number,
+                    combination_total=len(grid),
+                )
+            )
+        return rows
+
+    rows = []
+
+    with ProcessPoolExecutor(max_workers=workers) as executor:
+
+        futures = {
+            executor.submit(
+                evaluate_configuration_chunked,
+                search,
+                input_path,
+                dataset_id,
+                params,
+                chunk_padding_seconds=chunk_padding_seconds,
+                chunk_min_triggers=chunk_min_triggers,
+                chunk_gap_seconds=chunk_gap_seconds,
+                combination_number=number,
+                combination_total=len(grid),
+            ): number
+            for number, params in enumerate(grid, start=1)
+        }
+
+        for future in as_completed(futures):
+            try:
+                rows.append(future.result())
+            except Exception as exc:
+                logger.exception(
+                    "Configuration worker failed: {}: {}",
+                    type(exc).__name__,
+                    exc,
+                )
+                raise
+
+    order = {
+        search._configuration_id(params): number
+        for number, params in enumerate(grid, start=1)
+    }
+    rows.sort(key=lambda row: order.get(str(row["configuration_id"]), len(order) + 1))
+    return rows
+
+
+def evaluate_global_grid(
+    dataset_paths: dict[str, Path],
+    output_directory: Path,
+    *,
+    upsample_factor: int,
+    rebuild_cache: bool,
+    chunk_padding_seconds: float,
+    chunk_min_triggers: int,
+    chunk_gap_seconds: float | None,
+    workers: int = 1,
+) -> tuple[CorrectionGridSearch, pd.DataFrame]:
+    global_directory = output_directory / "global_grid"
+    cache_directory = global_directory / "dataset_cache"
+    cache_directory.mkdir(parents=True, exist_ok=True)
+
+    search = build_search(global_directory, upsample_factor=upsample_factor, prefix="global")
+    # Emit the exact numbered grid before any expensive dataset work starts.
+    search.write_combination_grid()
+    signature = grid_signature(
+        search,
+        dataset_paths,
+        upsample_factor,
+        chunk_padding_seconds=chunk_padding_seconds,
+        chunk_min_triggers=chunk_min_triggers,
+        chunk_gap_seconds=chunk_gap_seconds,
+    )
+    manifest_path = cache_directory / "manifest.json"
+
+    if manifest_path.exists() and not rebuild_cache:
+        old_manifest = json.loads(manifest_path.read_text())
+        if old_manifest.get("signature") != signature:
+            raise RuntimeError(
+                "The cache was created with different datasets, grid parameters, "
+                "upsampling settings, or chunk settings. Re-run with --rebuild-cache."
+            )
+
+    if rebuild_cache:
+        for cached_csv in cache_directory.glob("*.csv"):
+            cached_csv.unlink()
+
+    write_json(
+        manifest_path,
+        {
+            "signature": signature,
+            "upsample_factor": upsample_factor,
+            "chunking_engine": "Pipeline.run_chunked",
+            "chunk_padding_seconds": chunk_padding_seconds,
+            "chunk_min_triggers": chunk_min_triggers,
+            "chunk_gap_seconds": chunk_gap_seconds,
+        },
+    )
+
+    master_csv_path = global_directory / "global_master_results.csv"
+
+    if rebuild_cache and master_csv_path.exists():
+        master_csv_path.unlink()
+
+    total = len(dataset_paths)
+    master_header_written = False
+
+    for index, (dataset_id, path) in enumerate(dataset_paths.items(), start=1):
+        cache_path = cache_directory / f"{dataset_id}.csv"
+
+        if cache_path.exists() and not rebuild_cache:
+            logger.info(
+                "Using cached dataset {}/{}: {}",
+                index,
+                total,
+                dataset_id,
+            )
+
+            cached_frame = pd.read_csv(cache_path)
+
+            cached_frame.to_csv(
+                master_csv_path,
+                mode="a" if master_header_written else "w",
+                header=not master_header_written,
+                index=False,
+            )
+            master_header_written = True
+
+            del cached_frame
+            release_process_memory()
+            continue
+
+        logger.info(
+            "Evaluating dataset {}/{} with run_chunked: {}",
+            index,
+            total,
+            dataset_id,
+        )
+
+        rows = evaluate_dataset_chunked(
+            search,
+            path,
+            dataset_id,
+            chunk_padding_seconds=chunk_padding_seconds,
+            chunk_min_triggers=chunk_min_triggers,
+            chunk_gap_seconds=chunk_gap_seconds,
+            workers=workers,
+        )
+
+        frame = pd.DataFrame(rows)
+
+        temporary_path = cache_path.with_suffix(".csv.tmp")
+        frame.to_csv(temporary_path, index=False)
+        temporary_path.replace(cache_path)
+
+        frame.to_csv(
+            master_csv_path,
+            mode="a" if master_header_written else "w",
+            header=not master_header_written,
+            index=False,
+        )
+        master_header_written = True
+
+        del rows
+        del frame
+        release_process_memory()
+
+    if not master_csv_path.exists():
+        raise RuntimeError("No dataset results were written to the master CSV.")
+
+    master = pd.read_csv(master_csv_path)
+
+    search._finalize(master)
+
+    return search, master
+
+
+def parameter_stability(selected_rows: list[dict[str, Any]]) -> pd.DataFrame:
+    rows: list[dict[str, Any]] = []
+    n_folds = len(selected_rows)
+    for parameter in FLEX_PARAMETER_NAMES:
+        counts = Counter(str(row[parameter]) for row in selected_rows)
+        for value, count in sorted(counts.items()):
+            rows.append(
+                {
+                    "parameter": parameter,
+                    "value": value,
+                    "count": count,
+                    "fraction_of_folds": count / n_folds if n_folds else 0.0,
+                }
+            )
+    return pd.DataFrame(rows)
+
+
+def _save_figure(figure: plt.Figure, path: Path) -> None:
+    """Save a k-fold summary figure with consistent output quality."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    figure.savefig(path, dpi=180, bbox_inches="tight")
+    plt.close(figure)
+    logger.info("Saved k-fold visualization to {}", path)
+
+
+def plot_parameter_stability(
+    stability: pd.DataFrame,
+    output_path: Path,
+) -> Path | None:
+    """Plot how often each parameter value was selected across folds."""
+    if stability.empty:
+        return None
+
+    parameters = list(stability["parameter"].drop_duplicates())
+    figure, axes = plt.subplots(
+        len(parameters),
+        1,
+        figsize=(10, max(5, 2.6 * len(parameters))),
+        squeeze=False,
+    )
+    for axis, parameter in zip(axes[:, 0], parameters, strict=False):
+        subset = stability[stability["parameter"] == parameter]
+        positions = np.arange(len(subset))
+        bars = axis.bar(
+            positions,
+            subset["fraction_of_folds"],
+            color="#457b9d",
+            alpha=0.85,
+        )
+        axis.bar_label(
+            bars,
+            labels=[str(value) for value in subset["count"]],
+            padding=3,
+            fontsize=8,
+        )
+        axis.set_xticks(positions)
+        axis.set_xticklabels(subset["value"], rotation=25, ha="right")
+        axis.set_ylim(0.0, 1.1)
+        axis.set_ylabel("Fold fraction")
+        axis.set_title(parameter)
+        axis.grid(axis="y", alpha=0.2)
+
+    figure.suptitle(
+        "Selected-parameter stability across held-out folds\n"
+        "Bar labels show the number of folds"
+    )
+    figure.tight_layout()
+    _save_figure(figure, output_path)
+    return output_path
+
+
+def plot_held_out_metric_heatmap(
+    tests: pd.DataFrame,
+    metric_columns: list[str],
+    output_path: Path,
+) -> Path | None:
+    """Plot standardized held-out metrics so different scales are comparable."""
+    if tests.empty or not metric_columns:
+        return None
+
+    numeric = tests[metric_columns].apply(pd.to_numeric, errors="coerce")
+    numeric = numeric.loc[:, numeric.notna().any(axis=0)]
+    if numeric.empty:
+        return None
+
+    means = numeric.mean(axis=0)
+    standard_deviations = numeric.std(axis=0, ddof=0).replace(0.0, 1.0)
+    standardized = (numeric - means) / standard_deviations
+    values = standardized.to_numpy(dtype=float).T
+
+    figure_width = max(8.0, 1.1 * len(tests))
+    figure_height = min(30.0, max(6.0, 0.38 * len(numeric.columns)))
+    figure, axis = plt.subplots(figsize=(figure_width, figure_height))
+    image = axis.imshow(
+        values,
+        aspect="auto",
+        interpolation="nearest",
+        cmap="coolwarm",
+        vmin=-2.5,
+        vmax=2.5,
+    )
+    axis.set_xticks(np.arange(len(tests)))
+    axis.set_xticklabels(
+        [
+            f"Fold {int(row.fold)}\n{row.test_dataset_id}"
+            for row in tests.itertuples()
+        ],
+        rotation=35,
+        ha="right",
+    )
+    axis.set_yticks(np.arange(len(numeric.columns)))
+    axis.set_yticklabels(numeric.columns)
+    axis.set_title(
+        "Held-out metric consistency across folds\n"
+        "Column-wise z-scores; compare variation within each metric"
+    )
+    axis.set_xlabel("Held-out dataset")
+    figure.colorbar(image, ax=axis, label="Standard deviations from metric mean")
+    figure.tight_layout()
+    _save_figure(figure, output_path)
+    return output_path
+
+
+def plot_held_out_runtime(
+    tests: pd.DataFrame,
+    output_path: Path,
+) -> Path | None:
+    """Plot held-out runtime and successful chunk counts by fold."""
+    if tests.empty or "execution_time" not in tests:
+        return None
+
+    positions = np.arange(len(tests))
+    figure, runtime_axis = plt.subplots(figsize=(max(8.0, len(tests)), 5.5))
+    runtime_axis.bar(
+        positions,
+        pd.to_numeric(tests["execution_time"], errors="coerce"),
+        color="#6a4c93",
+        alpha=0.82,
+        label="Execution time",
+    )
+    runtime_axis.set_ylabel("Execution time (seconds)")
+    runtime_axis.set_xticks(positions)
+    runtime_axis.set_xticklabels(
+        tests["test_dataset_id"].astype(str),
+        rotation=35,
+        ha="right",
+    )
+    runtime_axis.grid(axis="y", alpha=0.2)
+
+    if {"n_chunks", "successful_chunks"}.issubset(tests.columns):
+        chunk_axis = runtime_axis.twinx()
+        totals = pd.to_numeric(tests["n_chunks"], errors="coerce")
+        successful = pd.to_numeric(
+            tests["successful_chunks"],
+            errors="coerce",
+        )
+        ratios = successful / totals.replace(0.0, np.nan)
+        chunk_axis.plot(
+            positions,
+            ratios,
+            color="#2a9d8f",
+            marker="o",
+            linewidth=2,
+            label="Successful chunk fraction",
+        )
+        chunk_axis.set_ylim(0.0, 1.05)
+        chunk_axis.set_ylabel("Successful chunk fraction")
+
+    runtime_axis.set_title("Held-out evaluation runtime and chunk reliability")
+    figure.tight_layout()
+    _save_figure(figure, output_path)
+    return output_path
+
+
+def summarize_results(
+    output_directory: Path,
+    test_rows: list[dict[str, Any]],
+    selected_rows: list[dict[str, Any]],
+) -> None:
+    tests = pd.DataFrame(test_rows).sort_values("fold").reset_index(drop=True)
+    selected = pd.DataFrame(selected_rows).sort_values("fold").reset_index(drop=True)
+    tests.to_csv(output_directory / "all_held_out_test_metrics.csv", index=False)
+    selected.to_csv(output_directory / "selected_parameters_by_fold.csv", index=False)
+    stability = parameter_stability(selected_rows)
+    stability.to_csv(output_directory / "parameter_stability.csv", index=False)
+    plot_parameter_stability(
+        stability,
+        output_directory / "parameter_stability.png",
+    )
+
+    excluded = {
+        "fold",
+        "test_dataset_id",
+        "dataset_id",
+        "configuration_id",
+        *FLEX_PARAMETER_NAMES,
+        "success",
+        "error",
+    }
+    operational = {
+        "execution_time",
+        "n_chunks",
+        "successful_chunks",
+        "n_training_datasets",
+    }
+    rows: list[dict[str, Any]] = []
+    metric_columns: list[str] = []
+    for column in tests.columns:
+        if column in excluded:
+            continue
+        values = pd.to_numeric(tests[column], errors="coerce")
+        if not values.notna().any():
+            continue
+        if column not in operational:
+            metric_columns.append(column)
+        rows.append(
+            {
+                "metric": column,
+                "n": int(values.notna().sum()),
+                "mean": float(values.mean()),
+                "std": float(values.std()),
+                "median": float(values.median()),
+                "minimum": float(values.min()),
+                "maximum": float(values.max()),
+            }
+        )
+    pd.DataFrame(rows).to_csv(output_directory / "held_out_metric_summary.csv", index=False)
+    plot_held_out_metric_heatmap(
+        tests,
+        metric_columns,
+        output_directory / "held_out_metrics_heatmap.png",
+    )
+    plot_held_out_runtime(
+        tests,
+        output_directory / "held_out_runtime.png",
+    )
+
+def evaluate_fold_worker(
+    fold_number: int,
+    test_id: str,
+    dataset_paths: dict[str, Path],
+    master_results: pd.DataFrame,
+    output_directory: Path,
+    *,
+    upsample_factor: int,
+    chunk_padding_seconds: float,
+    chunk_min_triggers: int,
+    chunk_gap_seconds: float | None,
+) -> tuple[dict[str, Any] | None, dict[str, Any] | None, str | None]:
+    """Select parameters and evaluate one held-out fold."""
+
+    fold_directory = output_directory / f"fold_{fold_number:03d}_test_{test_id}"
+    training_directory = fold_directory / "training"
+    fold_directory.mkdir(parents=True, exist_ok=True)
+
+    training_rows: pd.DataFrame | None = None
+    fold_search: CorrectionGridSearch | None = None
+
+    try:
+        logger.info(
+            "Fold {}: selecting from cached results; held out '{}'",
+            fold_number,
+            test_id,
+        )
+
+        training_rows = master_results.loc[
+            master_results["dataset_id"] != test_id
+        ].copy()
+
+        fold_search = build_search(
+            training_directory,
+            upsample_factor=upsample_factor,
+            prefix="training",
+        )
+
+        training_result = fold_search._finalize(training_rows)
+        selected_params = fold_search.select_pareto_configuration(
+            training_result
+        )
+
+        selection_record = {
+            "fold": fold_number,
+            "test_dataset_id": test_id,
+            "n_training_datasets": len(dataset_paths) - 1,
+            **selected_params,
+        }
+
+        write_json(
+            fold_directory / "selected_parameters.json",
+            selection_record,
+        )
+
+        test_row = evaluate_configuration_chunked(
+            fold_search,
+            dataset_paths[test_id],
+            test_id,
+            selected_params,
+            chunk_padding_seconds=chunk_padding_seconds,
+            chunk_min_triggers=chunk_min_triggers,
+            chunk_gap_seconds=chunk_gap_seconds,
+        )
+
+        test_row = {
+            "fold": fold_number,
+            "test_dataset_id": test_id,
+            **test_row,
+        }
+
+        pd.DataFrame([test_row]).to_csv(
+            fold_directory / "test_metrics.csv",
+            index=False,
+        )
+
+        logger.info(
+            "Fold {} complete: test success={}",
+            fold_number,
+            test_row.get("success"),
+        )
+
+        return selection_record, test_row, None
+
+    except Exception as exc:
+        message = f"Fold {fold_number} (test={test_id}) failed: {exc}"
+        logger.exception(message)
+        return None, None, message + "\n" + traceback.format_exc()
+
+    finally:
+        training_rows = None
+        fold_search = None
+        release_process_memory()
+
+
+def run_folds(
+    dataset_paths: dict[str, Path],
+    master_results: pd.DataFrame,
+    output_directory: Path,
+    *,
+    upsample_factor: int,
+    chunk_padding_seconds: float,
+    chunk_min_triggers: int,
+    chunk_gap_seconds: float | None,
+    workers: int = 1,
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]], list[str]]:
+    selected_rows: list[dict[str, Any]] = []
+    test_rows: list[dict[str, Any]] = []
+    failures: list[str] = []
+
+    fold_arguments = [
+        (fold_number, test_id)
+        for fold_number, test_id in enumerate(dataset_paths, start=1)
+    ]
+
+    if workers <= 1:
+        for fold_number, test_id in fold_arguments:
+            selected, test, failure = evaluate_fold_worker(
+                fold_number,
+                test_id,
+                dataset_paths,
+                master_results,
+                output_directory,
+                upsample_factor=upsample_factor,
+                chunk_padding_seconds=chunk_padding_seconds,
+                chunk_min_triggers=chunk_min_triggers,
+                chunk_gap_seconds=chunk_gap_seconds,
+            )
+
+            if selected is not None:
+                selected_rows.append(selected)
+            if test is not None:
+                test_rows.append(test)
+            if failure is not None:
+                failures.append(failure)
+
+        return selected_rows, test_rows, failures
+
+    with ProcessPoolExecutor(max_workers=workers) as executor:
+        future_to_fold = {
+            executor.submit(
+                evaluate_fold_worker,
+                fold_number,
+                test_id,
+                dataset_paths,
+                master_results,
+                output_directory,
+                upsample_factor=upsample_factor,
+                chunk_padding_seconds=chunk_padding_seconds,
+                chunk_min_triggers=chunk_min_triggers,
+                chunk_gap_seconds=chunk_gap_seconds,
+            ): (fold_number, test_id)
+            for fold_number, test_id in fold_arguments
+        }
+
+        for future in as_completed(future_to_fold):
+            fold_number, test_id = future_to_fold[future]
+
+            try:
+                selected, test, failure = future.result()
+            except Exception as exc:
+                failures.append(
+                    f"Fold {fold_number} (test={test_id}) worker failed: "
+                    f"{type(exc).__name__}: {exc}\n"
+                    f"{traceback.format_exc()}"
+                )
+                continue
+
+            if selected is not None:
+                selected_rows.append(selected)
+            if test is not None:
+                test_rows.append(test)
+            if failure is not None:
+                failures.append(failure)
+
+    selected_rows.sort(key=lambda row: int(row["fold"]))
+    test_rows.sort(key=lambda row: int(row["fold"]))
+
+    return selected_rows, test_rows, failures
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(
+        description="Cached leave-one-dataset-out Flex validation using Pipeline.run_chunked."
+    )
+    parser.add_argument("--input-dir", type=Path, required=True)
+    parser.add_argument("--output-dir", type=Path, required=True)
+    parser.add_argument(
+        "--workers",
+        type=int,
+        default=1,
+        help="Number of independent parameter configurations or folds to run concurrently.",
+    )
+    parser.add_argument("--upsample-factor", type=int, default=10)
+    parser.add_argument("--no-recursive", action="store_true")
+    parser.add_argument("--rebuild-cache", action="store_true")
+    parser.add_argument("--chunk-padding-seconds", type=float, default=60.0)
+    parser.add_argument("--chunk-min-triggers", type=int, default=31)
+    parser.add_argument(
+        "--chunk-gap-seconds",
+        type=float,
+        default=None,
+        help="Optional explicit trigger-section gap; None uses run_chunked's inference.",
+    )
+    args = parser.parse_args()
+
+    if args.workers < 1:
+        raise ValueError("--workers must be at least 1")
+    if args.upsample_factor < 1:
+        raise ValueError("--upsample-factor must be at least 1")
+    if args.chunk_padding_seconds < 0:
+        raise ValueError("--chunk-padding-seconds must be non-negative")
+    if args.chunk_min_triggers < 2:
+        raise ValueError("--chunk-min-triggers must be at least 2")
+    if args.chunk_gap_seconds is not None and args.chunk_gap_seconds <= 0:
+        raise ValueError("--chunk-gap-seconds must be positive when provided")
+
+    input_directory = args.input_dir.expanduser().resolve()
+    output_directory = args.output_dir.expanduser().resolve()
+    if not input_directory.is_dir():
+        raise NotADirectoryError(f"Input directory does not exist: {input_directory}")
+
+    dataset_paths = unique_dataset_ids(
+        find_input_datasets(input_directory, recursive=not args.no_recursive)
+    )
+    output_directory.mkdir(parents=True, exist_ok=True)
+
+    signature_search = build_search(
+        output_directory / ".signature",
+        upsample_factor=args.upsample_factor,
+        prefix="signature",
+    )
+    configuration_count = len(signature_search.iter_parameter_grid())
+    logger.info(
+        "Chunked cached validation: {} datasets x {} configurations = {} unique runs",
+        len(dataset_paths),
+        configuration_count,
+        len(dataset_paths) * configuration_count,
+    )
+
+    _, master_results = evaluate_global_grid(
+        dataset_paths,
+        output_directory,
+        upsample_factor=args.upsample_factor,
+        rebuild_cache=args.rebuild_cache,
+        chunk_padding_seconds=args.chunk_padding_seconds,
+        chunk_min_triggers=args.chunk_min_triggers,
+        chunk_gap_seconds=args.chunk_gap_seconds,
+        workers=args.workers,
+    )
+
+    selected_rows, test_rows, failures = run_folds(
+        dataset_paths,
+        master_results,
+        output_directory,
+        upsample_factor=args.upsample_factor,
+        chunk_padding_seconds=args.chunk_padding_seconds,
+        chunk_min_triggers=args.chunk_min_triggers,
+        chunk_gap_seconds=args.chunk_gap_seconds,
+        workers=args.workers,
+    )
+
+    if test_rows:
+        summarize_results(output_directory, test_rows, selected_rows)
+    if failures:
+        failure_path = output_directory / "failed_folds.txt"
+        failure_path.write_text("\n\n".join(failures) + "\n")
+        raise RuntimeError(f"{len(failures)} fold(s) failed. See {failure_path}")
+
+    print("\nChunked cached leave-one-dataset-out validation complete")
+    print("========================================================")
+    print(f"Datasets/folds: {len(dataset_paths)}")
+    print(f"Unique grid runs: {len(dataset_paths) * configuration_count}")
+    print(f"Final held-out runs: {len(dataset_paths)}")
+    print(f"Results: {output_directory / 'all_held_out_test_metrics.csv'}")
+    print(f"Combination grid: {output_directory / 'global_grid/global_combinations.csv'}")
+    print(f"Combination heatmap: {output_directory / 'global_grid/global_combination_heatmap.png'}")
+    print(f"Pareto matrix: {output_directory / 'global_grid/global_pareto_matrix.png'}")
+    print(f"Fold metric heatmap: {output_directory / 'held_out_metrics_heatmap.png'}")
+    print(f"Parameter stability: {output_directory / 'parameter_stability.png'}")
+
+
+if __name__ == "__main__":
+    main()

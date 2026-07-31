@@ -200,10 +200,19 @@ class TriggerAligner(Processor):
                     description=["Aligned_Trigger"] * len(aligned_triggers),
                 )
             )
-            return context.with_raw(raw_copy).with_metadata(new_metadata)
+            return context.with_raw(
+                raw_copy,
+                copy_estimated_noise=False,
+            ).with_metadata(
+                new_metadata,
+                copy_estimated_noise=False,
+            )
 
         # --- RETURN ---
-        return context.with_metadata(new_metadata)
+        return context.with_metadata(
+            new_metadata,
+            copy_estimated_noise=False,
+        )
 
     def _pick_ref_channel(self, raw: mne.io.Raw) -> int:
         if self.ref_channel is not None:
@@ -504,10 +513,16 @@ class SubsampleAligner(Processor):
         if self.apply_to_raw and np.any(shifts):
             logger.debug("Applying subsample shifts to raw data segments")
             raw_copy = self._apply_shifts_to_raw(raw, triggers, shifts, pre_samples, post_samples, n_samples)
-            return context.with_raw(raw_copy).with_metadata(new_metadata)
+            return context.with_raw(raw_copy).with_metadata(
+                new_metadata,
+                copy_estimated_noise=False,
+            )
 
         # --- RETURN ---
-        return context.with_metadata(new_metadata)
+        return context.with_metadata(
+            new_metadata,
+            copy_estimated_noise=False,
+        )
 
     def _resolve_search_radius(self, upsampling_factor: int) -> int:
         """Return the effective search radius in samples.

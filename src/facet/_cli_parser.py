@@ -136,6 +136,24 @@ def _build_parser(
         help="FARM search half-window multiplier when no explicit half-window is set.",
     )
     process.add_argument(
+        "--flex-threshold",
+        type=float,
+        default=0.975,
+        help="Pearson correlation cutoff for --correction-mode=flex.",
+    )
+    process.add_argument(
+        "--flex-min-accepted",
+        type=int,
+        default=5,
+        help="Minimum candidate epochs averaged by --correction-mode=flex.",
+    )
+    process.add_argument(
+        "--flex-distribution",
+        choices=("equal", "normal"),
+        default="equal",
+        help="Equal or temporal-normal averaging weights for --correction-mode=flex.",
+    )
+    process.add_argument(
         "--slices-per-volume",
         type=int,
         default=None,
@@ -173,12 +191,12 @@ def _build_parser(
         "--search-window-factor",
         type=float,
         default=3.0,
-        help="Trigger realignment search-window factor for AAS-style modes.",
+        help="Trigger realignment search-window factor for template-matrix correction modes.",
     )
     process.add_argument(
         "--interpolate-volume-gaps",
         action="store_true",
-        help="Interpolate estimated noise in volume gaps for AAS/FARM modes.",
+        help="Interpolate estimated noise in volume gaps for compatible Flex-based modes.",
     )
     process.add_argument(
         "--apply-epoch-alpha-scaling",
@@ -254,14 +272,40 @@ def _build_parser(
         help="Run the high-memory correction steps one channel at a time.",
     )
     process.add_argument(
+        "--track-estimated-noise",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help=(
+            "Retain the full artifact estimate for ANC/inspection. "
+            "Disable it to reduce RAM when only corrected data and metrics are needed."
+        ),
+    )
+    process.add_argument(
         "--fixed-length-chunks",
         action="store_true",
         help="Use memory-estimated fixed-length chunks instead of trigger-section chunks.",
     )
     process.add_argument("--min-chunks", type=int, default=2, help="Minimum fixed-length chunk count.")
     process.add_argument("--max-chunks", type=int, default=128, help="Maximum fixed-length chunk count.")
-    process.add_argument("--memory-budget-mb", type=float, default=None, help="Explicit per-chunk memory budget.")
+    process.add_argument(
+        "--max-memory-mb",
+        "--memory-budget-mb",
+        dest="max_memory_mb",
+        type=float,
+        default=None,
+        help="Explicit memory ceiling in MiB (default: automatic from available RAM).",
+    )
     process.add_argument("--memory-fraction", type=float, default=0.5, help="Fraction of available memory to use.")
+    process.add_argument(
+        "--disable-chunking",
+        action="store_true",
+        help="Process each input as one full run after a memory-safety check.",
+    )
+    process.add_argument(
+        "--force-full-run",
+        action="store_true",
+        help="With --disable-chunking, bypass the memory-safety refusal. May exhaust RAM.",
+    )
     process.add_argument(
         "--trigger-section-padding-seconds",
         type=float,

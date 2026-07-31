@@ -20,6 +20,23 @@ from facet.evaluation import (
 )
 
 
+def _assert_nested_numeric_equal(actual, expected) -> None:
+    """Compare nested metric structures while tolerating floating roundoff."""
+    if isinstance(expected, dict):
+        assert actual.keys() == expected.keys()
+        for key in expected:
+            _assert_nested_numeric_equal(actual[key], expected[key])
+        return
+
+    np.testing.assert_allclose(
+        np.asarray(actual),
+        np.asarray(expected),
+        rtol=1e-13,
+        atol=1e-15,
+        equal_nan=True,
+    )
+
+
 @pytest.mark.unit
 class TestReferenceIntervalSelector:
     """Tests for ReferenceIntervalSelector processor."""
@@ -415,6 +432,52 @@ def test_evaluation_processors_accept_verbose_mode(sample_context):
         context = proc.execute(context)
         metrics = context.metadata.custom.get("metrics", {})
         assert metric_key in metrics
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize(
+    ("processor_type", "metric_key"),
+    [
+        (SNRCalculator, "snr"),
+        (RMSCalculator, "rms_ratio"),
+        (RMSResidualCalculator, "rms_residual"),
+        (MedianArtifactCalculator, "median_artifact"),
+        (LegacySNRCalculator, "legacy_snr"),
+        (FFTAllenCalculator, "fft_allen"),
+        (FFTNiazyCalculator, "fft_niazy"),
+    ],
+)
+def test_channel_blocking_preserves_metric_values(
+    sample_context,
+    processor_type,
+    metric_key,
+):
+    """One-channel blocks must produce the same metrics as one full block."""
+    full_result = processor_type(channel_block_size=None).execute(sample_context)
+    blocked_result = processor_type(channel_block_size=1).execute(sample_context)
+
+    full_metric = full_result.metadata.custom["metrics"][metric_key]
+    blocked_metric = blocked_result.metadata.custom["metrics"][metric_key]
+    _assert_nested_numeric_equal(blocked_metric, full_metric)
+
+
+@pytest.mark.unit
+def test_metric_metadata_update_does_not_copy_estimated_noise(
+    sample_context_with_noise,
+):
+    """Read-only metric processors share the unchanged noise allocation."""
+    original_noise = sample_context_with_noise.get_estimated_noise()
+
+    result = SNRCalculator(channel_block_size=1).execute(sample_context_with_noise)
+
+    assert result.get_estimated_noise() is original_noise
+
+
+@pytest.mark.unit
+def test_metric_channel_block_size_must_be_positive():
+    """Invalid block sizes should fail before a potentially expensive run."""
+    with pytest.raises(ValueError, match="channel_block_size"):
+        SNRCalculator(channel_block_size=0)
 
 
 @pytest.mark.unit

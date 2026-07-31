@@ -47,15 +47,20 @@ from .core import (
 
 # Correction processors
 from .correction import (
+    # CORRELATION_THRESHOLD_GRID,
     AASCorrection,
     AveragedArtifactSubtraction,  # Alias
     AvgArtWghtCorrespondingSliceCorrection,
     AvgArtWghtMoosmannCorrection,
     AvgArtWghtSliceTriggerCorrection,
     AvgArtWghtVolumeTriggerCorrection,
+    CorrectionGridSearch,
+    CorrectionGridSearchResult,
     CorrespondingSliceCorrection,
     FARMArtifactCorrection,
     FARMCorrection,
+    Flex,
+    FlexCorrection,
     MoosmannCorrection,
     RemoveVolumeArtifactCorrection,
     SliceTriggerCorrection,
@@ -223,7 +228,10 @@ __all__ = [
     "MATLABPreFilter",
     "AnalyzeDataReport",
     "CheckDataReport",
-    # Correction
+    # Correction template engine
+    "Flex",
+    "FlexCorrection",
+    # Legacy template-matrix strategies
     "AASCorrection",
     "AveragedArtifactSubtraction",
     "CorrespondingSliceCorrection",
@@ -236,6 +244,10 @@ __all__ = [
     "AvgArtWghtMoosmannCorrection",
     "FARMCorrection",
     "FARMArtifactCorrection",
+    # Correction search and independent correction processors
+    "CorrectionGridSearch",
+    "CorrectionGridSearchResult",
+    # "CORRELATION_THRESHOLD_GRID",
     "VolumeArtifactCorrection",
     "RemoveVolumeArtifactCorrection",
     # Evaluation

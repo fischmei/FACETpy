@@ -104,21 +104,25 @@ class MATLABPreFilter(Processor):
             )
             logger.debug("MATLABPreFilter processed channel {}", ch_name)
 
-        result = context.with_raw(raw)
-
         # --- NOISE ---
+        estimated_noise = None
         if context.has_estimated_noise():
-            noise = context.get_estimated_noise().copy()
+            estimated_noise = context.get_estimated_noise().copy()
             for i, ch_idx in enumerate(target_indices):
-                noise[ch_idx] = self._filter_channel(
-                    data=noise[ch_idx],
+                estimated_noise[ch_idx] = self._filter_channel(
+                    data=estimated_noise[ch_idx],
                     sfreq=sfreq,
                     channel_pos=i,
                     context=context,
                     acq_start=acq_start,
                     acq_end=acq_end,
                 )
-            result.set_estimated_noise(noise)
+
+        result = context.with_raw(
+            raw,
+            estimated_noise=estimated_noise,
+            copy_estimated_noise=False,
+        )
 
         # --- METADATA ---
         md = result.metadata.copy()
@@ -128,15 +132,25 @@ class MATLABPreFilter(Processor):
             "acq_start_sample": int(acq_start),
             "acq_end_sample": int(acq_end),
         }
-        return result.with_metadata(md)
+        return result.with_metadata(
+            md,
+            copy_estimated_noise=False,
+        )
 
     def _resolve_target_indices(self, raw: mne.io.Raw) -> list[int]:
         """Resolve picks to channel indices."""
         try:
-            picked = raw.copy().pick(picks=self.picks, verbose=False)
+            from mne.io.pick import _picks_to_idx
+
+            indices = _picks_to_idx(
+                raw.info,
+                self.picks,
+                none="all",
+                exclude=(),
+            )
         except Exception as exc:
             raise ProcessorValidationError(f"Invalid picks '{self.picks}': {exc}") from exc
-        return [raw.ch_names.index(ch) for ch in picked.ch_names]
+        return [int(index) for index in indices]
 
     def _resolve_acquisition_bounds(self, context: ProcessingContext) -> tuple[int, int]:
         """Resolve acquisition bounds for padded filtering."""

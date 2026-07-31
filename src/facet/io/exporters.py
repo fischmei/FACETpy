@@ -7,6 +7,7 @@ Author: FACETpy Team
 Date: 2025-01-12
 """
 
+from copy import copy
 from pathlib import Path
 
 import mne
@@ -15,6 +16,21 @@ from loguru import logger
 from mne_bids import BIDSPath, write_raw_bids
 
 from ..core import ProcessingContext, Processor, ProcessorValidationError, register_processor
+
+
+def _copy_raw_metadata(raw: mne.io.BaseRaw) -> mne.io.BaseRaw:
+    """Return an independent Raw shell that shares the signal data.
+
+    Export preparation occasionally needs to adjust metadata or select
+    channels.  ``Raw.copy()`` duplicates the complete preloaded signal, which
+    can be several gigabytes and is unnecessary for those operations.  A
+    shallow copy keeps the read-only signal buffer shared while the mutable
+    metadata containers receive independent copies.
+    """
+    export_raw = copy(raw)
+    export_raw.info = raw.info.copy()
+    export_raw._annotations = raw.annotations.copy()
+    return export_raw
 
 
 def _detect_export_extension(path: Path) -> str:
@@ -72,7 +88,9 @@ class EDFExporter(Processor):
 
     def process(self, context: ProcessingContext) -> ProcessingContext:
         # --- EXTRACT ---
-        raw = context.get_raw().copy()
+        # EDF header sanitization modifies ``info``.  Copy the Raw shell and
+        # metadata, but share the large signal buffer with the input context.
+        raw = _copy_raw_metadata(context.get_raw())
 
         # --- LOG ---
         logger.info("Exporting to EDF: {}", self.path)
@@ -128,7 +146,7 @@ class BDFExporter(Processor):
         super().__init__()
 
     def process(self, context: ProcessingContext) -> ProcessingContext:
-        raw = context.get_raw().copy()
+        raw = _copy_raw_metadata(context.get_raw())
         logger.info("Exporting to BDF: {}", self.path)
         Path(self.path).parent.mkdir(parents=True, exist_ok=True)
         raw.export(self.path, fmt="bdf", overwrite=self.overwrite)
@@ -163,7 +181,7 @@ class BrainVisionExporter(Processor):
         super().__init__()
 
     def process(self, context: ProcessingContext) -> ProcessingContext:
-        raw = context.get_raw().copy()
+        raw = _copy_raw_metadata(context.get_raw())
         logger.info("Exporting to BrainVision: {}", self.path)
         Path(self.path).parent.mkdir(parents=True, exist_ok=True)
         raw.export(self.path, fmt="brainvision", overwrite=self.overwrite)
@@ -198,7 +216,7 @@ class EEGLABExporter(Processor):
         super().__init__()
 
     def process(self, context: ProcessingContext) -> ProcessingContext:
-        raw = context.get_raw().copy()
+        raw = _copy_raw_metadata(context.get_raw())
         logger.info("Exporting to EEGLAB (.set): {}", self.path)
         Path(self.path).parent.mkdir(parents=True, exist_ok=True)
         raw.export(self.path, fmt="eeglab", overwrite=self.overwrite)
@@ -233,7 +251,7 @@ class FIFExporter(Processor):
         super().__init__()
 
     def process(self, context: ProcessingContext) -> ProcessingContext:
-        raw = context.get_raw().copy()
+        raw = context.get_raw()
         logger.info("Exporting to FIF: {}", self.path)
         Path(self.path).parent.mkdir(parents=True, exist_ok=True)
         raw.save(self.path, overwrite=self.overwrite, verbose=False)
@@ -417,7 +435,8 @@ class BIDSExporter(Processor):
 
     def process(self, context: ProcessingContext) -> ProcessingContext:
         # --- EXTRACT ---
-        raw = context.get_raw().copy()
+        source_raw = context.get_raw()
+        raw = source_raw
 
         # --- LOG ---
         logger.info(
@@ -441,6 +460,10 @@ class BIDSExporter(Processor):
         # Drop stim channels (BIDS convention)
         stim_channels = mne.pick_types(raw.info, meg=False, eeg=False, stim=True)
         if len(stim_channels) > 0:
+            # Channel selection changes Raw metadata and allocates the selected
+            # output channels.  Copy only the lightweight Raw shell first so
+            # the input context stays unchanged without duplicating all data.
+            raw = _copy_raw_metadata(source_raw)
             raw.drop_channels([raw.ch_names[ch] for ch in stim_channels])
 
         events = None

@@ -111,6 +111,44 @@ class TestProcessingContext:
         assert context2.get_raw() is raw2
         assert not np.array_equal(context1.get_raw()._data, context2.get_raw()._data)
 
+    def test_with_raw_copies_estimated_noise_by_default(self, sample_context):
+        """Ordinary immutable operations keep independent noise arrays."""
+        noise = np.ones_like(sample_context.get_raw()._data)
+        sample_context.set_estimated_noise(noise)
+
+        context2 = sample_context.with_raw(sample_context.get_raw().copy())
+
+        assert context2.get_estimated_noise() is not noise
+        np.testing.assert_array_equal(context2.get_estimated_noise(), noise)
+        context2.get_estimated_noise()[0, 0] = 2.0
+        assert sample_context.get_estimated_noise()[0, 0] == 1.0
+
+    def test_with_raw_can_transfer_replacement_estimated_noise(self, sample_context):
+        """Callers can transfer an owned replacement without a full copy."""
+        old_noise = np.zeros_like(sample_context.get_raw()._data)
+        replacement = np.ones_like(old_noise)
+        sample_context.set_estimated_noise(old_noise)
+
+        context2 = sample_context.with_raw(
+            sample_context.get_raw().copy(),
+            estimated_noise=replacement,
+            copy_estimated_noise=False,
+        )
+
+        assert context2.get_estimated_noise() is replacement
+        assert sample_context.get_estimated_noise() is old_noise
+
+    def test_with_raw_can_drop_estimated_noise(self, sample_context):
+        """Explicit None distinguishes dropping noise from preserving it."""
+        sample_context.set_estimated_noise(np.ones_like(sample_context.get_raw()._data))
+
+        context2 = sample_context.with_raw(
+            sample_context.get_raw().copy(),
+            estimated_noise=None,
+        )
+
+        assert not context2.has_estimated_noise()
+
     def test_with_metadata(self, sample_context):
         """Test creating new context with different metadata."""
         new_metadata = sample_context.metadata.copy()
@@ -123,6 +161,18 @@ class TestProcessingContext:
 
         # Check new context has new metadata
         assert context2.metadata.artifact_length == 100
+
+    def test_with_metadata_can_share_estimated_noise_explicitly(self, sample_context):
+        """Metadata-only callers can explicitly avoid copying read-only noise."""
+        noise = np.ones_like(sample_context.get_raw()._data)
+        sample_context.set_estimated_noise(noise)
+
+        context2 = sample_context.with_metadata(
+            sample_context.metadata.copy(),
+            copy_estimated_noise=False,
+        )
+
+        assert context2.get_estimated_noise() is noise
 
     def test_get_triggers(self, sample_context):
         """Test getting triggers."""
@@ -158,6 +208,23 @@ class TestProcessingContext:
         retrieved_noise = sample_context.get_estimated_noise()
         assert np.array_equal(retrieved_noise, noise)
 
+    def test_accumulate_noise_can_transfer_first_contribution(self, sample_context):
+        """An owned first contribution need not be duplicated."""
+        noise = np.ones_like(sample_context.get_raw()._data)
+
+        sample_context.accumulate_noise(noise, copy=False)
+
+        assert sample_context.get_estimated_noise() is noise
+
+    def test_accumulate_noise_copies_first_contribution_by_default(self, sample_context):
+        """Default accumulation retains its historical independent copy."""
+        noise = np.ones_like(sample_context.get_raw()._data)
+
+        sample_context.accumulate_noise(noise)
+
+        assert sample_context.get_estimated_noise() is not noise
+        np.testing.assert_array_equal(sample_context.get_estimated_noise(), noise)
+
     def test_processing_history(self, sample_context):
         """Test processing history tracking."""
         # Initially empty
@@ -179,9 +246,11 @@ class TestProcessingContext:
         data = sample_context.to_dict()
 
         assert isinstance(data, dict)
-        assert "raw" in data
+        assert "raw" not in data
+        assert "raw_data" in data
         assert "metadata" in data
         assert "history" in data
+        assert data["raw_data"] is sample_context.get_raw()._data
 
     def test_from_dict(self, sample_context):
         """Test deserialization from dict."""

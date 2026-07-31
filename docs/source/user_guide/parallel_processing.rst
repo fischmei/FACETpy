@@ -538,6 +538,26 @@ For the same processor chain, ``channel_sequential=True`` typically lowers
 peak memory because only one channel's large intermediate representation is
 kept in memory at a time.
 
+When ANC is not part of the pipeline and only corrected data and metrics are
+required, the full artifact estimate can also be omitted::
+
+   correction = Flex(
+       window_size=30,
+       track_estimated_noise=False,
+   )
+
+The corrected signal is unchanged. This option only disables retention of the
+full-length estimated-noise array, so it must not be used before
+``ANCCorrection``. The CLI equivalent is
+``--no-track-estimated-noise``.
+
+Evaluation metrics load EEG channels in blocks of eight by default. The block
+size can be tuned without changing metric definitions::
+
+   metric = FFTAllenCalculator(channel_block_size=4)
+
+Pass ``channel_block_size=None`` to restore the legacy all-channel allocation.
+
 Overhead
 ~~~~~~~~
 

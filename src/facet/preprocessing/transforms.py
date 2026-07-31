@@ -443,16 +443,20 @@ class MagicErasor(Processor):
             logger.info("magic_erasor finished without edits; returning context unchanged.")
             return context
 
-        raw._data[:] = edited_data
-        result = context.with_raw(raw)
-
         # --- NOISE ---
+        noise = None
         if context.has_estimated_noise():
             noise = context.get_estimated_noise().copy()
             self._apply_edits_to_noise(noise, target_picks, edits)
-            result.set_estimated_noise(noise)
         else:
             logger.debug("No noise estimate present - skipping noise propagation in magic_erasor")
+
+        raw._data[:] = edited_data
+        result = context.with_raw(
+            raw,
+            estimated_noise=noise,
+            copy_estimated_noise=False,
+        )
 
         # --- METADATA ---
         metadata = result.metadata.copy()
@@ -465,19 +469,28 @@ class MagicErasor(Processor):
         logger.info("magic_erasor applied {} edit(s).", len(edits))
 
         # --- RETURN ---
-        return result.with_metadata(metadata)
+        return result.with_metadata(
+            metadata,
+            copy_estimated_noise=False,
+        )
 
     def _resolve_target_picks(self, raw: mne.io.BaseRaw) -> list[int]:
         """Resolve configured picks to channel indices."""
         try:
-            picked_raw = raw.copy().pick(picks=self.picks, verbose=False)
+            from mne.io.pick import _picks_to_idx
+
+            picks = _picks_to_idx(
+                raw.info,
+                self.picks,
+                none="all",
+                exclude=(),
+            )
         except Exception as exc:
             raise ProcessorValidationError(f"Invalid picks '{self.picks}': {exc}") from exc
 
-        picks = [raw.ch_names.index(name) for name in picked_raw.ch_names]
         if len(picks) == 0:
             raise ProcessorValidationError(f"No channels selected by picks='{self.picks}'.")
-        return picks
+        return [int(index) for index in picks]
 
     def _resolve_preview_channel(self, raw: mne.io.BaseRaw, target_picks: list[int]) -> int:
         """Resolve configured preview channel."""
@@ -1250,10 +1263,8 @@ class ChannelStandardizer(Processor):
         if rename_map:
             raw.rename_channels(rename_map)
 
-        # --- BUILD RESULT ---
-        new_ctx = context.with_raw(raw)
-
         # --- NOISE ---
+        selected_noise = None
         if context.has_estimated_noise():
             estimated_noise = context.get_estimated_noise()
             if estimated_noise is None or estimated_noise.shape[0] != len(input_raw.ch_names):
@@ -1265,9 +1276,16 @@ class ChannelStandardizer(Processor):
 
             index_by_name = {ch_name: idx for idx, ch_name in enumerate(input_raw.ch_names)}
             selected_indices = [index_by_name[ch_name] for ch_name in selected_channels]
-            new_ctx.set_estimated_noise(estimated_noise[selected_indices, :].copy())
+            selected_noise = estimated_noise[selected_indices, :].copy()
         else:
             logger.debug("No noise estimate present — skipping noise propagation")
+
+        # --- BUILD RESULT ---
+        new_ctx = context.with_raw(
+            raw,
+            estimated_noise=selected_noise,
+            copy_estimated_noise=False,
+        )
 
         metadata = new_ctx.metadata.copy()
         metadata.custom["channel_standardizer"] = {
@@ -1281,7 +1299,10 @@ class ChannelStandardizer(Processor):
         }
 
         # --- RETURN ---
-        return new_ctx.with_metadata(metadata)
+        return new_ctx.with_metadata(
+            metadata,
+            copy_estimated_noise=False,
+        )
 
     def _resolve_target_channels(self) -> list[str]:
         """Resolve standard configuration to an ordered target channel list."""

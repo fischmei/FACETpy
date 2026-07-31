@@ -72,6 +72,36 @@ class TestAASCorrection:
         noise = result.get_estimated_noise()
         assert noise.shape == corrected_data.shape
 
+    def test_aas_can_skip_noise_without_changing_correction(self, sample_context):
+        """AAS exposes Flex's memory-saving diagnostic-noise switch."""
+        tracked = AASCorrection(
+            window_size=5,
+            track_estimated_noise=True,
+        ).execute(sample_context)
+        untracked = AASCorrection(
+            window_size=5,
+            track_estimated_noise=False,
+        ).execute(sample_context)
+
+        np.testing.assert_array_equal(
+            untracked.get_raw()._data,
+            tracked.get_raw()._data,
+        )
+        assert not untracked.has_estimated_noise()
+
+    def test_aas_saves_matrix_plot_for_chunk_runs(self, sample_context, tmp_path):
+        """AAS should emit a matrix-plot image when a chunk output path is available."""
+        output_path = tmp_path / "chunk_output.edf"
+        metadata = sample_context.metadata.copy()
+        metadata.custom["chunk"] = {"output_path": str(output_path)}
+        context = sample_context.with_metadata(metadata)
+
+        aas = AASCorrection(window_size=5)
+        aas.execute(context)
+
+        generated_plot = output_path.with_suffix(".aas_matrices.png")
+        assert generated_plot.exists()
+
     def test_aas_reduces_artifact_amplitude(self, sample_raw_with_artifacts, sample_triggers):
         """Test that AAS actually reduces artifact amplitude."""
         from facet.core import ProcessingMetadata
@@ -286,6 +316,23 @@ class TestPCACorrection:
 
         assert result.get_raw() is not None
 
+    def test_pca_can_skip_noise_without_changing_correction(self, sample_context):
+        """PCA residual storage is optional and does not affect subtraction."""
+        tracked = PCACorrection(
+            n_components=2,
+            track_estimated_noise=True,
+        ).execute(sample_context)
+        untracked = PCACorrection(
+            n_components=2,
+            track_estimated_noise=False,
+        ).execute(sample_context)
+
+        np.testing.assert_array_equal(
+            untracked.get_raw()._data,
+            tracked.get_raw()._data,
+        )
+        assert not untracked.has_estimated_noise()
+
     def test_pca_with_zero_components_skips(self, sample_context):
         """Test that PCA with n_components=0 skips processing."""
         original_data = sample_context.get_raw()._data.copy()
@@ -354,6 +401,12 @@ class TestFARMCorrection:
         )
         row_sums = matrix.sum(axis=1)
         np.testing.assert_allclose(row_sums, np.ones_like(row_sums), atol=1e-12)
+
+    def test_farm_search_half_window_does_not_scale_with_window_size(self):
+        """FARM should not expand the candidate search span via a window-size multiplier."""
+        farm = FARMCorrection(window_size=5, search_half_window=None, search_half_window_factor=9.0)
+
+        assert farm._resolve_search_half_window(5) == 5
 
 
 @pytest.mark.unit
@@ -452,7 +505,7 @@ class TestAASWeightingVariants:
     """Tests for additional MATLAB-style AAS weighting variants."""
 
     def test_weighting_variants_accept_epoch_alpha_scaling(self, temp_dir):
-        """All AAS-derived weighting variants should expose shared epoch alpha scaling."""
+        """All Flex template variants should expose shared epoch alpha scaling."""
         rp_file = temp_dir / "rp_alpha.tsv"
         rp_file.write_text("x\ty\tz\tpitch\troll\tyaw\n0\t0\t0\t0\t0\t0\n", encoding="utf-8")
 

@@ -80,6 +80,7 @@ module-root = "src"
 build-fastranc = "facet.build:compile_fastranc"
 facetpy-run = "facet.cli:main"
 facetpy-to-bids = "facet.cli:bids_main"
+facetpy-convert-bids = "facet._cli_convert_bids:convert_bids_main"
 
 [tool.ruff]
 target-version = "py311"

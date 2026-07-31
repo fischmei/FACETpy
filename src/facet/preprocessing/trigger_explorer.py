@@ -167,10 +167,19 @@ class TriggerExplorer(Processor):
                     description=["Trigger"] * len(triggers),
                 )
             )
-            return context.with_raw(raw_copy).with_metadata(new_metadata)
+            return context.with_raw(
+                raw_copy,
+                copy_estimated_noise=False,
+            ).with_metadata(
+                new_metadata,
+                copy_estimated_noise=False,
+            )
 
         # --- RETURN ---
-        return context.with_metadata(new_metadata)
+        return context.with_metadata(
+            new_metadata,
+            copy_estimated_noise=False,
+        )
 
     # ------------------------------------------------------------------
     # Event collection helpers

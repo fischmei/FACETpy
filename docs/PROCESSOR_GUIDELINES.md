@@ -715,7 +715,7 @@ Not every processor needs its own file, and not everything should be packed into
 
 | Situation | Approach | Example |
 |---|---|---|
-| **Complex standalone processor** (> 150 lines, multiple helpers) | **Own file** | `aas.py` → `AASCorrection` |
+| **Complex standalone processor** (> 150 lines, multiple helpers) | **Own file** | `flex.py` → `Flex` template engine |
 | **Family of related processors** sharing a base class | **One file** for the family | `filtering.py` → `Filter`, `HighPassFilter`, `LowPassFilter`, `BandPassFilter` |
 | **Simple thin processors** that are conceptually a group | **One file** per group | `transforms.py` → `Crop`, `PickChannels`, `DropChannels` |
 | **Utility logic shared across processors** in the same module | **Module-level `_utils.py`** file | `preprocessing/_utils.py` → `extract_epoch_with_padding()` |
@@ -736,11 +736,15 @@ Keep together when it's **cohesive** — when the helper only makes sense in the
 
 ```
 correction/
-  aas.py                 ← AASCorrection + its private helpers
-                           (_calc_averaging_matrix, _find_correlated_epochs, etc.)
+  flex.py                ← shared D → A → N template lifecycle + default strategy
+  aas.py                 ← legacy AAS matrix strategy only
+  farm.py                ← FARM matrix strategy only
 ```
 
-Private methods like `_calc_averaging_matrix` are specific to AAS and would never be used elsewhere. They stay as methods on the class.
+The shared epoch extraction, subtraction, realignment, and reporting lifecycle
+belongs to ``Flex``. Matrix builders such as ``_calc_averaging_matrix`` stay on
+the concrete strategy class because their selection rules differ, while each
+strategy inherits the common Flex lifecycle.
 
 ### 6.4 When to Extract to a Utility Module
 
@@ -1620,8 +1624,8 @@ The following issues were identified during the audit that triggered this guidel
 | Inconsistent noise estimate propagation | Filter, NotchFilter, Resample | §3.6 |
 | Missing `suppress_stdout()` on MNE calls | BIDSLoader | §3.7 |
 | Empty `validate()` overrides | BIDSLoader | §4.3, §15.7 |
-| `process()` exceeds 100 lines | AASCorrection, ANCCorrection, MissingTriggerDetector, SubsampleAligner, TriggerDetector | §5.1 |
-| Lazy imports for core deps (scipy, random) | AASCorrection, ANCCorrection, TriggerAligner, QRSTriggerDetector | §11.1 |
+| `process()` exceeds 100 lines | ANCCorrection, MissingTriggerDetector, SubsampleAligner, TriggerDetector | §5.1 |
+| Lazy imports for core deps (scipy, random) | ANCCorrection, TriggerAligner, QRSTriggerDetector | §11.1 |
 | Missing type annotations | Various | §2.7 |
 | Inconsistent docstring format | Various | §2.8 |
 | No processor registration | Various | §12.1 |

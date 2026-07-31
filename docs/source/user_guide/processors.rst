@@ -382,9 +382,33 @@ MagicErasor precision controls:
 Correction Processors
 ~~~~~~~~~~~~~~~~~~~~~
 
+**Shared Flex template engine**
+
+``Flex`` inherits directly from ``Processor`` and provides the common
+trigger-locked template workflow. For every processed channel, it extracts an
+epoch matrix ``D`` (epochs by samples), obtains an averaging matrix ``A`` from
+the selected strategy, calculates the template matrix ``N = A @ D``, and
+subtracts row ``n`` of ``N`` from target epoch ``n``. Trigger realignment,
+optional template scaling and gap interpolation, estimated-noise accumulation,
+and matrix reporting are also shared by this engine.
+
+The existing named template corrections are direct ``Flex`` subclasses kept
+for compatibility. ``AASCorrection`` retains its block running-average rule,
+``FARMCorrection`` retains its absolute-correlation ranking,
+``CorrespondingSliceCorrection`` and ``VolumeTriggerCorrection`` retain their
+volume-aware index rules, ``SliceTriggerCorrection`` retains its odd/even
+selection, and ``MoosmannCorrection`` retains its motion-informed weights.
+They share the surrounding correction engine, but each still constructs a
+different ``A``.
+
+``ANCCorrection``, ``PCACorrection``, and ``VolumeArtifactCorrection`` remain
+independent processors because they do not construct templates as ``A @ D``.
+They respectively apply adaptive filtering to an existing noise estimate,
+reconstruct PCA residuals, and blend artifacts around volume transitions.
+
 **AASCorrection** - Averaged Artifact Subtraction
 
-The main correction algorithm:
+The compatibility strategy for the established AAS averaging matrix:
 
 .. code-block:: python
 
@@ -396,6 +420,57 @@ The main correction algorithm:
        realign_after_averaging=True,  # Realign to template
    )
    context = aas.execute(context)
+
+**Flex** - Flexible correlation-based artifact subtraction
+
+``Flex`` creates a separate artifact template for every target epoch and EEG
+channel. Its candidate window is exact and future-first: it takes the next
+``window_size`` non-target epochs when they exist. Near the end of the
+recording, it fills only the missing positions with the nearest preceding
+epochs. The target epoch is never included. If the recording contains fewer
+than ``window_size + 1`` epochs, all available non-target epochs are used.
+
+For example, with eight epochs numbered 0 through 7 and ``window_size=4``:
+
+- target 2 uses candidates ``[3, 4, 5, 6]``;
+- target 6 uses ``[3, 4, 5, 7]`` (one future epoch and three backfilled epochs);
+- target 7 uses ``[3, 4, 5, 6]`` (four backfilled epochs).
+
+Candidates with a signed Pearson correlation greater than or equal to
+``threshold`` are accepted. All candidates that pass remain selected, even
+when their number exceeds ``min_accepted``. If too few pass, the remaining
+candidates are added from highest to lowest signed correlation until
+``min_accepted`` is reached (or every available candidate has been used).
+Ties prefer the epoch nearest to the target, then the lower epoch index.
+
+``N_distribution="equal"`` gives each of the ``k`` selected epochs weight
+``1 / k``. ``N_distribution="normal"`` instead applies a temporal Gaussian:
+the unnormalized weight for selected epoch ``j`` and target ``n`` is
+``exp(-0.5 * (abs(j - n) / sigma)**2)``, where ``sigma`` is the larger of 1
+and one third of the effective candidate-window size. The weights are then
+normalized to sum to one. Thus, ``"normal"`` favors selected epochs closer in
+time; it does not favor past epochs over future epochs.
+
+Together, these parameters describe a continuum within Flex's native
+future-first strategy rather than a collection of named presets. A high
+threshold with a small ``min_accepted`` produces a selective template, while
+setting ``min_accepted=window_size`` forces every available candidate into the
+template. Intermediate threshold, minimum-count, window, and weighting choices
+span the behavior between those endpoints. They do not exactly recreate the
+legacy AAS, FARM, slice/volume, or motion-informed matrices; use the named
+compatibility subclass when one of those specific rules is required.
+
+.. code-block:: python
+
+   from facet.correction import Flex
+
+   flex = Flex(
+       window_size=30,          # Consider at most 30 non-target epochs.
+       threshold=0.975,         # Automatically accept signed r >= 0.975.
+       min_accepted=5,          # Backfill by correlation until at least 5 are used.
+       N_distribution="normal", # Give temporally closer selections more weight.
+   )
+   context = flex.execute(context)
 
 **ANCCorrection** - Adaptive Noise Cancellation
 

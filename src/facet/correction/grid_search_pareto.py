@@ -1,0 +1,1495 @@
+"""Flex-only grid search with multi-objective Pareto analysis.
+
+The module evaluates every valid combination of public :class:`Flex`
+parameters. It supports one dataset or a mapping of datasets, writes detailed
+and aggregate CSV files, identifies non-dominated parameter configurations,
+and creates Pareto, combination-result, and parameter-effect plots.
+
+Pareto selection is used because artifact correction has competing objectives:
+for example, SNR should increase while residual RMS and spectral distortion
+should decrease. A configuration is Pareto-optimal when no other configuration
+is at least as good on every objective and strictly better on at least one.
+"""
+
+from __future__ import annotations
+
+import gc
+import json
+from collections.abc import Callable, Mapping, Sequence
+from copy import deepcopy
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Any, Literal
+
+import matplotlib.pyplot as plt
+import numpy as np
+import pandas as pd
+from loguru import logger
+from sklearn.model_selection import ParameterGrid
+
+from ..core import (
+    Pipeline,
+    ProcessingContext,
+    Processor,
+    ProcessorValidationError,
+    register_processor,
+)
+from ..evaluation import (
+    FFTAllenCalculator,
+    FFTNiazyCalculator,
+    LegacySNRCalculator,
+    MedianArtifactCalculator,
+    RMSCalculator,
+    RMSResidualCalculator,
+    SNRCalculator,
+)
+from ..preprocessing import DownSample, TriggerDetector, UpSample
+from .flex import Flex
+
+ObjectiveDirection = Literal["min", "max"]
+ObjectiveSpec = tuple[str, str, ObjectiveDirection]
+MetricFactory = Callable[[], Processor]
+DatasetLoader = Callable[[Path, str], ProcessingContext]
+
+## Matrix parameters
+DEFAULT_WINDOW_SIZES = (10, 20, 30)
+DEFAULT_THRESHOLDS = (0.95, 0.975, 0.99) ##changed the 0.9 to 0.975 since 0.9 was never picked
+DEFAULT_MIN_ACCEPTED_VALUES = (5, 10)
+DEFAULT_N_DISTRIBUTIONS = ("equal", "normal")
+
+## Post parameters
+DEFAULT_REALIGN_AFTER_AVERAGING_VALUES = (True,)
+DEFAULT_SEARCH_WINDOW_FACTORS = (3.0,)  # always
+DEFAULT_INTERPOLATE_VOLUME_GAPS_VALUES = (True,)
+DEFAULT_APPLY_EPOCH_ALPHA_SCALING_VALUES = (True,)
+
+FLEX_PARAMETER_NAMES = (
+    "window_size",
+    "threshold",
+    "min_accepted",
+    "N_distribution",
+    "realign_after_averaging",
+    "search_window_factor",
+    "interpolate_volume_gaps",
+    "apply_epoch_alpha_scaling",
+)
+
+DEFAULT_METRIC_FACTORIES: tuple[MetricFactory, ...] = (
+    SNRCalculator,
+    LegacySNRCalculator,
+    RMSCalculator,
+    RMSResidualCalculator,
+    MedianArtifactCalculator,
+    FFTAllenCalculator,
+    FFTNiazyCalculator,
+)
+
+DEFAULT_PARETO_OBJECTIVES: dict[str, ObjectiveDirection] = {
+    "snr": "max",
+    "rms_residual": "min",
+    "fft_niazy_*": "min",
+}
+
+
+@dataclass(frozen=True)
+class CorrectionGridSearchResult:
+    """Tables and output paths produced by a Flex grid search."""
+
+    results: pd.DataFrame
+    aggregate_results: pd.DataFrame
+    parameter_effects: pd.DataFrame
+    pareto_results: pd.DataFrame
+    pareto_front: pd.DataFrame
+    csv_path: Path | None = None
+    aggregate_csv_path: Path | None = None
+    parameter_effects_csv_path: Path | None = None
+    pareto_csv_path: Path | None = None
+    combination_grid_csv_path: Path | None = None
+    pareto_2d_path: Path | None = None
+    pareto_3d_path: Path | None = None
+    pareto_matrix_path: Path | None = None
+    combination_heatmap_path: Path | None = None
+    parameter_effects_plot_path: Path | None = None
+
+    def to_metadata(self) -> dict[str, Any]:
+        """Return a JSON-compatible result summary."""
+        return {
+            "n_results": int(len(self.results)),
+            "n_configurations": int(len(self.aggregate_results)),
+            "n_pareto_configurations": int(len(self.pareto_front)),
+            "n_datasets": (int(self.results["dataset_id"].nunique()) if "dataset_id" in self.results else 0),
+            "csv_path": _path_to_string(self.csv_path),
+            "aggregate_csv_path": _path_to_string(self.aggregate_csv_path),
+            "parameter_effects_csv_path": _path_to_string(self.parameter_effects_csv_path),
+            "pareto_csv_path": _path_to_string(self.pareto_csv_path),
+            "combination_grid_csv_path": _path_to_string(self.combination_grid_csv_path),
+            "pareto_2d_path": _path_to_string(self.pareto_2d_path),
+            "pareto_3d_path": _path_to_string(self.pareto_3d_path),
+            "pareto_matrix_path": _path_to_string(self.pareto_matrix_path),
+            "combination_heatmap_path": _path_to_string(self.combination_heatmap_path),
+            "parameter_effects_plot_path": _path_to_string(self.parameter_effects_plot_path),
+        }
+
+
+@register_processor(force=True)
+class CorrectionGridSearch(Processor):
+    """Exhaustively evaluate Flex parameter combinations.
+
+    Each combination runs this pipeline::
+
+        TriggerDetector -> UpSample -> Flex -> DownSample -> metrics
+
+    Cross-dataset means are used for Pareto analysis. No arbitrary composite
+    score is used to declare a single universal winner.
+    """
+
+    name = "correction_grid_search"
+    description = "Flex-only grid search with Pareto analysis"
+    version = "3.2.0"
+
+    requires_triggers = False
+    requires_raw = True
+    modifies_raw = False
+    parallel_safe = False
+
+    def __init__(
+        self,
+        trigger_regex: str = r"\b1\b",
+        upsample_factor: int = 10,
+        output_csv: str | Path | None = "facet_grid_search_results.csv",
+        output_aggregate_csv: str | Path | None = "facet_grid_search_aggregate.csv",
+        output_parameter_effects_csv: str | Path | None = "facet_grid_search_parameter_effects.csv",
+        output_pareto_csv: str | Path | None = "facet_grid_search_pareto.csv",
+        output_combination_grid_csv: str | Path | None = "facet_grid_search_combinations.csv",
+        output_pareto_2d: str | Path | None = "facet_grid_search_pareto_2d.png",
+        output_pareto_3d: str | Path | None = "facet_grid_search_pareto_3d.png",
+        output_pareto_matrix: str | Path | None = "facet_grid_search_pareto_matrix.png",
+        output_combination_heatmap: str | Path | None = "facet_grid_search_combination_heatmap.png",
+        output_parameter_effects_plot: str | Path | None = "facet_grid_search_parameter_effects.png",
+        pareto_objectives: Mapping[str, ObjectiveDirection] | None = None,
+        parameter_effect_metric: str = "snr",
+        parameter_effect_direction: ObjectiveDirection = "max",
+        window_sizes: Sequence[int] | None = None,
+        thresholds: Sequence[float] | None = None,
+        min_accepted_values: Sequence[int] | None = None,
+        N_distributions: Sequence[str] | None = None,
+        realign_after_averaging_values: Sequence[bool] | None = None,
+        search_window_factors: Sequence[float] | None = None,
+        interpolate_volume_gaps_values: Sequence[bool] | None = None,
+        apply_epoch_alpha_scaling_values: Sequence[bool] | None = None,
+        metric_processors: Sequence[Processor | MetricFactory] | None = None,
+        track_estimated_noise: bool = False,
+        continue_on_error: bool = True,
+        show_progress: bool = False,
+    ) -> None:
+        self.trigger_regex = str(trigger_regex)
+        self.upsample_factor = int(upsample_factor)
+
+        self.output_csv = _optional_path(output_csv)
+        self.output_aggregate_csv = _optional_path(output_aggregate_csv)
+        self.output_parameter_effects_csv = _optional_path(output_parameter_effects_csv)
+        self.output_pareto_csv = _optional_path(output_pareto_csv)
+        self.output_combination_grid_csv = _optional_path(output_combination_grid_csv)
+        self.output_pareto_2d = _optional_path(output_pareto_2d)
+        self.output_pareto_3d = _optional_path(output_pareto_3d)
+        self.output_pareto_matrix = _optional_path(output_pareto_matrix)
+        self.output_combination_heatmap = _optional_path(output_combination_heatmap)
+        self.output_parameter_effects_plot = _optional_path(output_parameter_effects_plot)
+
+        self.pareto_objectives = dict(pareto_objectives or DEFAULT_PARETO_OBJECTIVES)
+        self.parameter_effect_metric = str(parameter_effect_metric)
+        self.parameter_effect_direction = _normalize_direction(
+            parameter_effect_direction,
+            name="parameter_effect_direction",
+        )
+
+        self.window_sizes = _as_int_tuple(
+            window_sizes or DEFAULT_WINDOW_SIZES,
+            name="window_sizes",
+        )
+        self.thresholds = _as_float_tuple(
+            thresholds or DEFAULT_THRESHOLDS,
+            name="thresholds",
+        )
+        self.min_accepted_values = _as_int_tuple(
+            min_accepted_values or DEFAULT_MIN_ACCEPTED_VALUES,
+            name="min_accepted_values",
+        )
+        self.N_distributions = _as_string_tuple(
+            N_distributions or DEFAULT_N_DISTRIBUTIONS,
+            name="N_distributions",
+        )
+        self.realign_after_averaging_values = _as_bool_tuple(
+            realign_after_averaging_values
+            if realign_after_averaging_values is not None
+            else DEFAULT_REALIGN_AFTER_AVERAGING_VALUES,
+            name="realign_after_averaging_values",
+        )
+        self.search_window_factors = _as_float_tuple(
+            search_window_factors or DEFAULT_SEARCH_WINDOW_FACTORS,
+            name="search_window_factors",
+        )
+        self.interpolate_volume_gaps_values = _as_bool_tuple(
+            interpolate_volume_gaps_values
+            if interpolate_volume_gaps_values is not None
+            else DEFAULT_INTERPOLATE_VOLUME_GAPS_VALUES,
+            name="interpolate_volume_gaps_values",
+        )
+        self.apply_epoch_alpha_scaling_values = _as_bool_tuple(
+            apply_epoch_alpha_scaling_values
+            if apply_epoch_alpha_scaling_values is not None
+            else DEFAULT_APPLY_EPOCH_ALPHA_SCALING_VALUES,
+            name="apply_epoch_alpha_scaling_values",
+        )
+
+        self._metric_processor_specs = tuple(metric_processors) if metric_processors is not None else None
+        self.track_estimated_noise = track_estimated_noise
+        self.continue_on_error = bool(continue_on_error)
+        self.show_progress = bool(show_progress)
+        self.last_result: CorrectionGridSearchResult | None = None
+
+        super().__init__()
+        self._validate_configuration()
+
+    def validate(self, context: ProcessingContext) -> None:
+        """Validate the input context and search configuration."""
+        super().validate(context)
+        self._validate_configuration()
+
+    def process(self, context: ProcessingContext) -> ProcessingContext:
+        """Run one-dataset search and attach its summary to metadata."""
+        result = self.run_search(
+            context,
+            dataset_id=self._infer_dataset_id(context),
+        )
+        metadata = context.metadata.copy()
+        metadata.custom["grid_search"] = result.to_metadata()
+        return context.with_metadata(
+            metadata,
+            copy_estimated_noise=False,
+        )
+
+    @property
+    def n_combinations(self) -> int:
+        """Number of valid parameter combinations."""
+        return len(self.iter_parameter_grid())
+
+    def iter_parameter_grid(self) -> list[dict[str, Any]]:
+        """Return every valid Flex parameter combination."""
+        grid = {
+            "window_size": self.window_sizes,
+            "threshold": self.thresholds,
+            "min_accepted": self.min_accepted_values,
+            "N_distribution": self.N_distributions,
+            "realign_after_averaging": self.realign_after_averaging_values,
+            "search_window_factor": self.search_window_factors,
+            "interpolate_volume_gaps": self.interpolate_volume_gaps_values,
+            "apply_epoch_alpha_scaling": self.apply_epoch_alpha_scaling_values,
+        }
+        return [dict(params) for params in ParameterGrid(grid) if params["min_accepted"] <= params["window_size"]]
+
+    def combination_grid_frame(self) -> pd.DataFrame:
+        """Return the complete, ordered search grid used by this instance."""
+        rows = []
+        for number, params in enumerate(self.iter_parameter_grid(), start=1):
+            rows.append(
+                {
+                    "combination_number": number,
+                    "configuration_id": self._configuration_id(params),
+                    **{parameter: params[parameter] for parameter in FLEX_PARAMETER_NAMES},
+                }
+            )
+        return pd.DataFrame(rows)
+
+    def write_combination_grid(self) -> Path | None:
+        """Write and log the complete grid before expensive processing starts."""
+        frame = self.combination_grid_frame()
+        path = self._write_csv(frame, self.output_combination_grid_csv)
+        logger.info(
+            "Prepared {} grid-search combination(s){}",
+            len(frame),
+            f"; complete grid: {path}" if path is not None else "",
+        )
+        return path
+
+    def build_pipeline(self, params: Mapping[str, Any]) -> Pipeline:
+        """Build one correction-and-evaluation pipeline."""
+        processors: list[Processor] = [
+            TriggerDetector(regex=self.trigger_regex),
+            UpSample(factor=self.upsample_factor),
+            self._build_flex(params),
+            DownSample(factor=self.upsample_factor),
+            *self._make_metric_processors(),
+        ]
+        return Pipeline(processors, name="Flex Grid Search")
+
+    def run_search(
+        self,
+        context: ProcessingContext,
+        *,
+        dataset_id: str | None = None,
+    ) -> CorrectionGridSearchResult:
+        """Run the full grid on one dataset."""
+        self.write_combination_grid()
+        resolved_id = dataset_id or self._infer_dataset_id(context)
+        rows = self._run_dataset(context, str(resolved_id))
+        return self._finalize(pd.DataFrame(rows))
+
+    def run_many(
+        self,
+        datasets: Mapping[str, ProcessingContext],
+    ) -> CorrectionGridSearchResult:
+        """Run the same grid across several already-loaded datasets.
+
+        This compatibility method retains the historical API. For large EEG
+        datasets, prefer :meth:`run_many_from_paths`, which loads and releases
+        one dataset at a time.
+        """
+        if not datasets:
+            raise ValueError("datasets must contain at least one dataset")
+
+        self.write_combination_grid()
+        rows: list[dict[str, Any]] = []
+        total = len(datasets)
+        for index, (dataset_id, context) in enumerate(datasets.items(), start=1):
+            logger.info("Starting dataset {}/{}: {}", index, total, dataset_id)
+            rows.extend(self._run_dataset(context, str(dataset_id)))
+
+        return self._finalize(pd.DataFrame(rows))
+
+    def run_many_from_paths(
+        self,
+        dataset_paths: Mapping[str, str | Path],
+        loader: DatasetLoader,
+    ) -> CorrectionGridSearchResult:
+        """Run the grid while keeping only one source dataset in memory.
+
+        Parameters
+        ----------
+        dataset_paths
+            Mapping from stable dataset identifiers to EDF files or MFF
+            datasets. Paths are passed to ``loader`` one at a time.
+        loader
+            Callable with signature ``loader(path, dataset_id)`` returning a
+            :class:`ProcessingContext`.
+
+        Notes
+        -----
+        Result rows are retained because they are small tabular records. The
+        MNE Raw object for each training dataset is released before the next
+        dataset is loaded. This changes memory use from O(number of datasets)
+        to approximately O(one dataset).
+        """
+        if not dataset_paths:
+            raise ValueError("dataset_paths must contain at least one dataset")
+        if not callable(loader):
+            raise TypeError("loader must be callable")
+
+        self.write_combination_grid()
+        rows: list[dict[str, Any]] = []
+        total = len(dataset_paths)
+
+        for index, (dataset_id, raw_path) in enumerate(dataset_paths.items(), start=1):
+            path = Path(raw_path)
+            context: ProcessingContext | None = None
+            logger.info("Starting streamed dataset {}/{}: {}", index, total, dataset_id)
+
+            try:
+                context = loader(path, str(dataset_id))
+                if not isinstance(context, ProcessingContext):
+                    raise TypeError(f"loader must return ProcessingContext, got {type(context).__name__}")
+                rows.extend(self._run_dataset(context, str(dataset_id)))
+            finally:
+                context = None
+                gc.collect()
+
+        return self._finalize(pd.DataFrame(rows))
+
+    def select_pareto_configuration(
+        self,
+        result: CorrectionGridSearchResult,
+    ) -> dict[str, Any]:
+        """Select one training configuration from the Pareto front.
+
+        Selection uses normalized Euclidean distance to the ideal point. The
+        calculation is based only on the supplied training result:
+
+        - maximize objectives are compared with the training-fold maximum;
+        - minimize objectives are compared with the training-fold minimum;
+        - every objective is normalized to [0, 1] within the Pareto front.
+
+        The returned dictionary contains only Flex constructor parameters.
+        """
+        front = result.pareto_front.copy()
+        if front.empty:
+            raise ProcessorValidationError("Cannot select parameters because the training Pareto front is empty")
+
+        objectives = self._resolve_objectives(front)
+        distance_squared = np.zeros(len(front), dtype=float)
+
+        for _, column, direction in objectives:
+            values = pd.to_numeric(front[column], errors="coerce").to_numpy(dtype=float)
+            if not np.all(np.isfinite(values)):
+                raise ProcessorValidationError(f"Pareto objective column {column!r} contains non-finite values")
+
+            minimum = float(np.min(values))
+            maximum = float(np.max(values))
+            span = maximum - minimum
+
+            if span <= np.finfo(float).eps:
+                normalized_distance = np.zeros_like(values)
+            elif direction == "max":
+                normalized_distance = (maximum - values) / span
+            else:
+                normalized_distance = (values - minimum) / span
+
+            distance_squared += normalized_distance**2
+
+        front["ideal_point_distance"] = np.sqrt(distance_squared)
+        ordered = front.sort_values(
+            ["ideal_point_distance", "success_rate", "mean_execution_time"],
+            ascending=[True, False, True],
+            na_position="last",
+        )
+        selected = ordered.iloc[0]
+
+        return {parameter: _python_scalar(selected[parameter]) for parameter in FLEX_PARAMETER_NAMES}
+
+    def evaluate_configuration(
+        self,
+        context: ProcessingContext,
+        params: Mapping[str, Any],
+        *,
+        dataset_id: str | None = None,
+    ) -> dict[str, Any]:
+        """Evaluate one fixed Flex configuration on one held-out dataset.
+
+        This method performs no search and no parameter selection. It is
+        intended for validation or external test data after parameters have
+        been selected using training data only.
+        """
+        missing = [parameter for parameter in FLEX_PARAMETER_NAMES if parameter not in params]
+        if missing:
+            raise ProcessorValidationError(f"Missing Flex parameter(s): {missing}")
+
+        resolved_id = dataset_id or self._infer_dataset_id(context)
+        return self._run_one_combination(
+            context,
+            str(resolved_id),
+            params,
+        )
+
+    def _run_dataset(
+        self,
+        context: ProcessingContext,
+        dataset_id: str,
+    ) -> list[dict[str, Any]]:
+        parameter_grid = self.iter_parameter_grid()
+        rows: list[dict[str, Any]] = []
+
+        for index, params in enumerate(parameter_grid, start=1):
+            logger.info(
+                "Dataset '{}', combination {}/{}: {}",
+                dataset_id,
+                index,
+                len(parameter_grid),
+                params,
+            )
+            row = self._run_one_combination(context, dataset_id, params)
+            rows.append(row)
+            if not row["success"] and not self.continue_on_error:
+                break
+
+        return rows
+
+    def _run_one_combination(
+        self,
+        context: ProcessingContext,
+        dataset_id: str,
+        params: Mapping[str, Any],
+    ) -> dict[str, Any]:
+        run_context = self._fresh_context(context)
+        result = self.build_pipeline(params).run(
+            initial_context=run_context,
+            show_progress=self.show_progress,
+        )
+
+        metrics: dict[str, float] = {}
+        if result.success and result.context is not None:
+            metrics = self._flatten_metrics(result.context.metadata.custom.get("metrics", {}))
+
+        row = {
+            "dataset_id": dataset_id,
+            "configuration_id": self._configuration_id(params),
+            **params,
+            "success": bool(result.success),
+            "execution_time": float(result.execution_time),
+            "error": "" if result.success else str(result.error),
+            **metrics,
+        }
+        # Keep only scalar/tabular output from this combination.
+        result.release_raw()
+        run_context = None
+        result = None
+        gc.collect()
+        return row
+
+    def _finalize(self, results: pd.DataFrame) -> CorrectionGridSearchResult:
+        aggregate = self._aggregate_results(results)
+        pareto_results = self._calculate_pareto_front(aggregate)
+        pareto_front = pareto_results[pareto_results["is_pareto"]].copy()
+        parameter_effects = self._calculate_parameter_effects(results)
+
+        paths = {
+            "csv_path": self._write_csv(results, self.output_csv),
+            "aggregate_csv_path": self._write_csv(
+                aggregate,
+                self.output_aggregate_csv,
+            ),
+            "parameter_effects_csv_path": self._write_csv(
+                parameter_effects,
+                self.output_parameter_effects_csv,
+            ),
+            "pareto_csv_path": self._write_csv(
+                pareto_results,
+                self.output_pareto_csv,
+            ),
+            "combination_grid_csv_path": self.write_combination_grid(),
+            "pareto_2d_path": self._plot_pareto(
+                aggregate,
+                pareto_results,
+                dimensions=2,
+                path=self.output_pareto_2d,
+            ),
+            "pareto_3d_path": self._plot_pareto(
+                aggregate,
+                pareto_results,
+                dimensions=3,
+                path=self.output_pareto_3d,
+            ),
+            "pareto_matrix_path": self._plot_pareto_matrix(
+                pareto_results,
+            ),
+            "combination_heatmap_path": self._plot_combination_heatmap(
+                pareto_results,
+            ),
+            "parameter_effects_plot_path": self._plot_parameter_effects(parameter_effects),
+        }
+
+        output = CorrectionGridSearchResult(
+            results=results,
+            aggregate_results=aggregate,
+            parameter_effects=parameter_effects,
+            pareto_results=pareto_results,
+            pareto_front=pareto_front,
+            **paths,
+        )
+        self.last_result = output
+        return output
+
+    def _aggregate_results(self, results: pd.DataFrame) -> pd.DataFrame:
+        """Average every numeric metric by parameter configuration."""
+        if results.empty:
+            return pd.DataFrame()
+
+        grouped = results.groupby("configuration_id", dropna=False)
+        aggregate = grouped.agg(
+            n_datasets=("dataset_id", "nunique"),
+            n_runs=("dataset_id", "size"),
+            successful_runs=("success", "sum"),
+            mean_execution_time=("execution_time", "mean"),
+        ).reset_index()
+        aggregate["success_rate"] = aggregate["successful_runs"] / aggregate["n_runs"]
+
+        parameters = grouped[list(FLEX_PARAMETER_NAMES)].first().reset_index()
+        metric_means = self._aggregate_metric_columns(results)
+
+        output = parameters.merge(aggregate, on="configuration_id", how="left")
+        if not metric_means.empty:
+            output = output.merge(
+                metric_means,
+                on="configuration_id",
+                how="left",
+            )
+        return output.sort_values(
+            ["success_rate", "configuration_id"],
+            ascending=[False, True],
+        ).reset_index(drop=True)
+
+    def _aggregate_metric_columns(self, results: pd.DataFrame) -> pd.DataFrame:
+        series: list[pd.Series] = []
+        for metric in self._metric_columns(results):
+            numeric = pd.to_numeric(results[metric], errors="coerce")
+            if not numeric.notna().any():
+                continue
+            means = (
+                pd.DataFrame(
+                    {
+                        "configuration_id": results["configuration_id"],
+                        metric: numeric,
+                    }
+                )
+                .groupby("configuration_id", dropna=False)[metric]
+                .mean()
+                .rename(f"mean_{metric}")
+            )
+            series.append(means)
+
+        if not series:
+            return pd.DataFrame()
+        return pd.concat(series, axis=1).reset_index()
+
+    def _calculate_pareto_front(
+        self,
+        aggregate: pd.DataFrame,
+    ) -> pd.DataFrame:
+        """Mark non-dominated configurations.
+
+        All objectives are converted internally to minimization. A row is
+        dominated when another row is no worse for every objective and better
+        for at least one objective.
+        """
+        if aggregate.empty:
+            return pd.DataFrame()
+
+        working = aggregate.copy()
+        objectives = self._resolve_objectives(working)
+        objective_columns = [column for _, column, _ in objectives]
+
+        objective_valid = (
+            working[objective_columns]
+            .apply(
+                pd.to_numeric,
+                errors="coerce",
+            )
+            .notna()
+            .all(axis=1)
+        )
+        working["objective_values_valid"] = objective_valid
+        working["pareto_eligible"] = False
+        working["is_pareto"] = False
+        working["ideal_point_distance"] = np.nan
+        working["is_selected_compromise"] = False
+        if not objective_valid.any():
+            return working
+
+        # Configurations evaluated successfully on fewer datasets are not
+        # directly comparable with complete configurations. Prefer the best
+        # available success rate, normally 1.0, for Pareto membership.
+        best_success_rate = float(working.loc[objective_valid, "success_rate"].max())
+        eligible = objective_valid & np.isclose(
+            pd.to_numeric(working["success_rate"], errors="coerce"),
+            best_success_rate,
+        )
+        working["pareto_eligible"] = eligible
+        if best_success_rate < 1.0:
+            logger.warning(
+                "No configuration completed every run; Pareto analysis uses the highest success rate ({:.1%})",
+                best_success_rate,
+            )
+
+        eligible_positions = np.flatnonzero(eligible)
+        values = working.iloc[eligible_positions][objective_columns].to_numpy(dtype=float)
+        for index, (_, _, direction) in enumerate(objectives):
+            if direction == "max":
+                values[:, index] *= -1.0
+
+        dominated = np.zeros(len(values), dtype=bool)
+        for row_index, row in enumerate(values):
+            no_worse = np.all(values <= row, axis=1)
+            strictly_better = np.any(values < row, axis=1)
+            dominated[row_index] = bool(np.any(no_worse & strictly_better))
+
+        is_pareto_column = working.columns.get_loc("is_pareto")
+        working.iloc[eligible_positions, is_pareto_column] = ~dominated
+        front_mask = working["is_pareto"].to_numpy(dtype=bool)
+        if np.any(front_mask):
+            distances = self._ideal_point_distances(
+                working.loc[front_mask],
+                objectives,
+            )
+            working.loc[front_mask, "ideal_point_distance"] = distances
+
+        if np.any(front_mask):
+            selected_index = (
+                working.loc[front_mask]
+                .sort_values(
+                    [
+                        "ideal_point_distance",
+                        "success_rate",
+                        "mean_execution_time",
+                    ],
+                    ascending=[True, False, True],
+                    na_position="last",
+                )
+                .index[0]
+            )
+            working.loc[selected_index, "is_selected_compromise"] = True
+
+        working["pareto_objectives"] = json.dumps(
+            self.pareto_objectives,
+            sort_keys=True,
+        )
+        return working.sort_values(
+            [
+                "is_selected_compromise",
+                "is_pareto",
+                "success_rate",
+                "ideal_point_distance",
+            ],
+            ascending=[False, False, False, True],
+        ).reset_index(drop=True)
+
+    @staticmethod
+    def _ideal_point_distances(
+        frame: pd.DataFrame,
+        objectives: Sequence[ObjectiveSpec],
+    ) -> np.ndarray:
+        """Return normalized Euclidean distance from each row to the ideal."""
+        distance_squared = np.zeros(len(frame), dtype=float)
+        for _, column, direction in objectives:
+            values = pd.to_numeric(frame[column], errors="coerce").to_numpy(dtype=float)
+            minimum = float(np.min(values))
+            maximum = float(np.max(values))
+            span = maximum - minimum
+            if span <= np.finfo(float).eps:
+                normalized_distance = np.zeros_like(values)
+            elif direction == "max":
+                normalized_distance = (maximum - values) / span
+            else:
+                normalized_distance = (values - minimum) / span
+            distance_squared += normalized_distance**2
+        return np.sqrt(distance_squared)
+
+    def _resolve_objectives(self, frame: pd.DataFrame) -> list[ObjectiveSpec]:
+        if len(self.pareto_objectives) < 2:
+            raise ProcessorValidationError("Pareto analysis requires at least two objectives")
+
+        resolved: list[ObjectiveSpec] = []
+        for name, direction in self.pareto_objectives.items():
+            normalized = _normalize_direction(direction, name=str(name))
+            column = self._resolve_metric_column(frame, str(name))
+            resolved.append((str(name), column, normalized))
+        return resolved
+
+    @staticmethod
+    def _resolve_metric_column(frame: pd.DataFrame, metric: str) -> str:
+        if metric.endswith("*"):
+            prefix = metric[:-1]
+            candidates = [column for column in frame.columns if column.startswith(f"mean_{prefix}")]
+            if not candidates:
+                raise ProcessorValidationError(f"No aggregate metric columns match {metric!r}")
+            generated = f"objective_{prefix.rstrip('_')}"
+            frame[generated] = (
+                frame[candidates]
+                .apply(
+                    pd.to_numeric,
+                    errors="coerce",
+                )
+                .mean(axis=1)
+            )
+            return generated
+
+        candidate = metric if metric in frame.columns else f"mean_{metric}"
+        if candidate not in frame.columns:
+            raise ProcessorValidationError(f"Metric {metric!r} was not found in aggregate results")
+        return candidate
+
+    def _calculate_parameter_effects(
+        self,
+        results: pd.DataFrame,
+    ) -> pd.DataFrame:
+        """Describe marginal effects for one explicitly selected metric."""
+        if results.empty:
+            return pd.DataFrame()
+
+        metric = self.parameter_effect_metric
+        if metric not in results.columns:
+            logger.warning(
+                "Parameter-effect metric '{}' was not produced; skipping effects",
+                metric,
+            )
+            return pd.DataFrame()
+
+        numeric = pd.to_numeric(results[metric], errors="coerce")
+        valid = results[results["success"] & numeric.notna()].copy()
+        valid[metric] = numeric.loc[valid.index]
+        if valid.empty:
+            return pd.DataFrame()
+
+        rows: list[dict[str, Any]] = []
+        for parameter in FLEX_PARAMETER_NAMES:
+            for value, subset in valid.groupby(parameter, dropna=True):
+                rows.append(
+                    {
+                        "parameter": parameter,
+                        "value": _python_scalar(value),
+                        "metric": metric,
+                        "direction": self.parameter_effect_direction,
+                        "n_runs": int(len(subset)),
+                        "n_datasets": int(subset["dataset_id"].nunique()),
+                        "mean": float(subset[metric].mean()),
+                        "median": float(subset[metric].median()),
+                        "std": float(subset[metric].std()),
+                        "minimum": float(subset[metric].min()),
+                        "maximum": float(subset[metric].max()),
+                    }
+                )
+
+        return (
+            pd.DataFrame(rows)
+            .sort_values(
+                ["parameter", "mean"],
+                ascending=[True, self.parameter_effect_direction == "min"],
+            )
+            .reset_index(drop=True)
+        )
+
+    def _plot_pareto(
+        self,
+        aggregate: pd.DataFrame,
+        pareto: pd.DataFrame,
+        *,
+        dimensions: int,
+        path: Path | None,
+    ) -> Path | None:
+        if path is None or aggregate.empty or pareto.empty:
+            return None
+
+        working = aggregate.copy()
+        objectives = self._resolve_objectives(working)
+        if len(objectives) < dimensions:
+            return None
+
+        selected = objectives[:dimensions]
+        columns = [column for _, column, _ in selected]
+        valid = (
+            working[columns]
+            .apply(
+                pd.to_numeric,
+                errors="coerce",
+            )
+            .notna()
+            .all(axis=1)
+        )
+        working = working.loc[valid]
+        if working.empty:
+            return None
+
+        eligible_ids = set(
+            pareto.loc[
+                pareto.get(
+                    "pareto_eligible",
+                    pd.Series(True, index=pareto.index),
+                ).astype(bool),
+                "configuration_id",
+            ]
+        )
+        working = working[working["configuration_id"].isin(eligible_ids)]
+        if working.empty:
+            return None
+
+        pareto_ids = set(pareto.loc[pareto["is_pareto"], "configuration_id"])
+        mask = working["configuration_id"].isin(pareto_ids)
+        selected_ids = set(
+            pareto.loc[
+                pareto.get(
+                    "is_selected_compromise",
+                    pd.Series(False, index=pareto.index),
+                ).astype(bool),
+                "configuration_id",
+            ]
+        )
+        selected_mask = working["configuration_id"].isin(selected_ids)
+        front_count = int(mask.sum())
+
+        if dimensions == 2:
+            fig, ax = plt.subplots(figsize=(9, 7))
+            ax.scatter(
+                working.loc[~mask, columns[0]],
+                working.loc[~mask, columns[1]],
+                color="#9ca3af",
+                edgecolors="none",
+                alpha=0.35,
+                label="Dominated",
+            )
+            ax.scatter(
+                working.loc[mask & ~selected_mask, columns[0]],
+                working.loc[mask & ~selected_mask, columns[1]],
+                marker="*",
+                s=120,
+                color="#e76f51",
+                edgecolors="#8f2d1d",
+                linewidths=0.5,
+                label="Multi-objective Pareto set",
+            )
+            if selected_mask.any():
+                ax.scatter(
+                    working.loc[selected_mask, columns[0]],
+                    working.loc[selected_mask, columns[1]],
+                    marker="D",
+                    s=100,
+                    color="#2a9d8f",
+                    edgecolors="black",
+                    linewidths=0.8,
+                    label="Selected ideal compromise",
+                    zorder=5,
+                )
+            ax.set_xlabel(selected[0][0])
+            ax.set_ylabel(selected[1][0])
+        else:
+            fig = plt.figure(figsize=(10, 8))
+            ax = fig.add_subplot(111, projection="3d")
+            ax.scatter(
+                working.loc[~mask, columns[0]],
+                working.loc[~mask, columns[1]],
+                working.loc[~mask, columns[2]],
+                color="#9ca3af",
+                alpha=0.25,
+                label="Dominated",
+            )
+            ax.scatter(
+                working.loc[mask & ~selected_mask, columns[0]],
+                working.loc[mask & ~selected_mask, columns[1]],
+                working.loc[mask & ~selected_mask, columns[2]],
+                marker="*",
+                s=100,
+                color="#e76f51",
+                edgecolors="#8f2d1d",
+                linewidths=0.5,
+                label="Multi-objective Pareto set",
+            )
+            if selected_mask.any():
+                ax.scatter(
+                    working.loc[selected_mask, columns[0]],
+                    working.loc[selected_mask, columns[1]],
+                    working.loc[selected_mask, columns[2]],
+                    marker="D",
+                    s=90,
+                    color="#2a9d8f",
+                    edgecolors="black",
+                    linewidths=0.8,
+                    label="Selected ideal compromise",
+                    zorder=5,
+                )
+            ax.set_xlabel(selected[0][0])
+            ax.set_ylabel(selected[1][0])
+            ax.set_zlabel(selected[2][0])
+
+        objective_count = len(objectives)
+        projection_note = (
+            f"Projection of {objective_count} objectives; stars may overlap or look dominated on the displayed axes"
+            if objective_count > dimensions
+            else f"All {objective_count} objectives shown"
+        )
+        ax.set_title(f"Flex Pareto set: {front_count}/{len(working)} configurations\n{projection_note}")
+        ax.legend()
+        if dimensions == 2:
+            ax.grid(True, alpha=0.25)
+        fig.tight_layout()
+        _save_figure(fig, path)
+        return path
+
+    def _plot_pareto_matrix(
+        self,
+        pareto: pd.DataFrame,
+    ) -> Path | None:
+        """Plot every pairwise objective projection in one readable figure."""
+        path = self.output_pareto_matrix
+        if path is None or pareto.empty:
+            return None
+
+        working = pareto.copy()
+        objectives = self._resolve_objectives(working)
+        columns = [column for _, column, _ in objectives]
+        valid = (
+            working[columns]
+            .apply(
+                pd.to_numeric,
+                errors="coerce",
+            )
+            .notna()
+            .all(axis=1)
+        )
+        working = working.loc[valid]
+        if "pareto_eligible" in working:
+            working = working[working["pareto_eligible"].astype(bool)]
+        if working.empty:
+            return None
+
+        is_front = working["is_pareto"].astype(bool)
+        is_selected = working.get(
+            "is_selected_compromise",
+            pd.Series(False, index=working.index),
+        ).astype(bool)
+        count = len(objectives)
+        fig, axes = plt.subplots(
+            count,
+            count,
+            figsize=(4 * count, 3.6 * count),
+            squeeze=False,
+        )
+
+        for row_index, (row_name, row_column, _) in enumerate(objectives):
+            for column_index, (
+                column_name,
+                column_column,
+                _,
+            ) in enumerate(objectives):
+                ax = axes[row_index, column_index]
+                if row_index == column_index:
+                    ax.hist(
+                        working.loc[~is_front, row_column],
+                        bins="auto",
+                        color="#9ca3af",
+                        alpha=0.55,
+                        label="Dominated",
+                    )
+                    ax.hist(
+                        working.loc[is_front, row_column],
+                        bins="auto",
+                        color="#e76f51",
+                        alpha=0.75,
+                        label="Pareto",
+                    )
+                else:
+                    ax.scatter(
+                        working.loc[~is_front, column_column],
+                        working.loc[~is_front, row_column],
+                        color="#9ca3af",
+                        alpha=0.3,
+                        s=24,
+                        edgecolors="none",
+                    )
+                    ax.scatter(
+                        working.loc[is_front & ~is_selected, column_column],
+                        working.loc[is_front & ~is_selected, row_column],
+                        marker="*",
+                        color="#e76f51",
+                        edgecolors="#8f2d1d",
+                        linewidths=0.4,
+                        s=80,
+                    )
+                    if is_selected.any():
+                        ax.scatter(
+                            working.loc[is_selected, column_column],
+                            working.loc[is_selected, row_column],
+                            marker="D",
+                            color="#2a9d8f",
+                            edgecolors="black",
+                            linewidths=0.7,
+                            s=65,
+                            zorder=5,
+                        )
+
+                if row_index == count - 1:
+                    ax.set_xlabel(column_name)
+                else:
+                    ax.tick_params(labelbottom=False)
+                if column_index == 0:
+                    ax.set_ylabel(row_name)
+                elif row_index != column_index:
+                    ax.tick_params(labelleft=False)
+                ax.grid(True, alpha=0.15)
+
+        axes[0, 0].legend(fontsize="small")
+        fig.suptitle("Flex objective trade-offs\n★ multi-objective Pareto set   ◆ selected ideal compromise")
+        fig.tight_layout()
+        _save_figure(fig, path)
+        return path
+
+    def _plot_combination_heatmap(
+        self,
+        pareto: pd.DataFrame,
+    ) -> Path | None:
+        """Plot normalized objective quality for every parameter combination."""
+        path = self.output_combination_heatmap
+        if path is None or pareto.empty:
+            return None
+
+        working = pareto.copy()
+        objectives = self._resolve_objectives(working)
+        columns = [column for _, column, _ in objectives]
+        valid = (
+            working[columns]
+            .apply(
+                pd.to_numeric,
+                errors="coerce",
+            )
+            .notna()
+            .all(axis=1)
+        )
+        if not valid.any():
+            return None
+
+        combination_numbers = self.combination_grid_frame().set_index("configuration_id")["combination_number"]
+        working["combination_number"] = working["configuration_id"].map(combination_numbers)
+        working = working.sort_values(
+            [
+                "is_selected_compromise",
+                "is_pareto",
+                "ideal_point_distance",
+                "combination_number",
+            ],
+            ascending=[False, False, True, True],
+            na_position="last",
+        )
+        valid = valid.reindex(working.index)
+
+        eligible = (
+            working.get(
+                "pareto_eligible",
+                pd.Series(True, index=working.index),
+            )
+            .astype(bool)
+            .to_numpy()
+            & valid.to_numpy()
+        )
+        if not np.any(eligible):
+            return None
+        quality = np.full(
+            (len(working), len(objectives)),
+            np.nan,
+            dtype=float,
+        )
+        for index, (_, column, direction) in enumerate(objectives):
+            values = pd.to_numeric(working[column], errors="coerce").to_numpy(dtype=float)
+            comparable_values = values[eligible]
+            minimum = float(np.min(comparable_values))
+            maximum = float(np.max(comparable_values))
+            span = maximum - minimum
+            if span <= np.finfo(float).eps:
+                quality[eligible, index] = 1.0
+            elif direction == "max":
+                quality[eligible, index] = (values[eligible] - minimum) / span
+            else:
+                quality[eligible, index] = (maximum - values[eligible]) / span
+
+        figure_height = min(30.0, max(6.0, 0.32 * len(working)))
+        fig, ax = plt.subplots(figsize=(max(7.0, 2.1 * len(objectives)), figure_height))
+        color_map = plt.get_cmap("viridis").copy()
+        color_map.set_bad("#d1d5db")
+        image = ax.imshow(
+            quality,
+            aspect="auto",
+            interpolation="nearest",
+            cmap=color_map,
+            vmin=0.0,
+            vmax=1.0,
+        )
+        objective_labels = [f"{name} ({'↑' if direction == 'max' else '↓'})" for name, _, direction in objectives]
+        ax.set_xticks(np.arange(len(objective_labels)))
+        ax.set_xticklabels(objective_labels, rotation=25, ha="right")
+
+        tick_positions = _nice_tick_positions(len(working), max_ticks=40)
+        row_labels = []
+        for position in tick_positions:
+            row = working.iloc[position]
+            marker = (
+                "◆"
+                if bool(row.get("is_selected_compromise", False))
+                else ("★" if bool(row["is_pareto"]) else "×" if not bool(row.get("pareto_eligible", True)) else "")
+            )
+            number = row.get("combination_number")
+            number_text = "?" if pd.isna(number) else str(int(number))
+            row_labels.append(f"#{number_text} {marker}".rstrip())
+        ax.set_yticks(tick_positions)
+        ax.set_yticklabels(row_labels)
+        ax.set_ylabel("Combination number")
+        ax.set_title(
+            "All combination results: normalized objective quality\n"
+            "1 = best comparable result; ★ Pareto; ◆ selected; "
+            "× incomplete/ineligible"
+        )
+        fig.colorbar(image, ax=ax, label="Normalized quality")
+        fig.tight_layout()
+        _save_figure(fig, path)
+        return path
+
+    def _plot_parameter_effects(
+        self,
+        effects: pd.DataFrame,
+    ) -> Path | None:
+        path = self.output_parameter_effects_plot
+        if path is None or effects.empty:
+            return None
+
+        parameters = list(effects["parameter"].drop_duplicates())
+        fig, axes = plt.subplots(
+            len(parameters),
+            1,
+            figsize=(10, max(4, 3 * len(parameters))),
+            squeeze=False,
+        )
+
+        for ax, parameter in zip(axes[:, 0], parameters, strict=False):
+            subset = effects[effects["parameter"] == parameter]
+            positions = np.arange(len(subset))
+            ax.errorbar(
+                positions,
+                subset["mean"].to_numpy(dtype=float),
+                yerr=subset["std"].fillna(0.0).to_numpy(dtype=float),
+                marker="o",
+                linestyle="-",
+            )
+            ax.set_xticks(positions)
+            ax.set_xticklabels(
+                subset["value"].astype(str),
+                rotation=35,
+                ha="right",
+            )
+            ax.set_title(parameter)
+            ax.set_ylabel(self.parameter_effect_metric)
+            ax.grid(True, alpha=0.25)
+
+        axes[-1, 0].set_xlabel("Parameter value")
+        fig.suptitle(f"Flex parameter effects: {self.parameter_effect_metric}")
+        fig.tight_layout()
+        _save_figure(fig, path)
+        return path
+
+    def _build_flex(self, params: Mapping[str, Any]) -> Flex:
+        return Flex(
+            window_size=int(params["window_size"]),
+            threshold=float(params["threshold"]),
+            min_accepted=int(params["min_accepted"]),
+            N_distribution=str(params["N_distribution"]),
+            realign_after_averaging=bool(params["realign_after_averaging"]),
+            search_window_factor=float(params["search_window_factor"]),
+            interpolate_volume_gaps=bool(params["interpolate_volume_gaps"]),
+            apply_epoch_alpha_scaling=bool(params["apply_epoch_alpha_scaling"]),
+            track_estimated_noise=self.track_estimated_noise,
+        )
+
+    def _make_metric_processors(self) -> list[Processor]:
+        specs = self._metric_processor_specs or DEFAULT_METRIC_FACTORIES
+        processors: list[Processor] = []
+        for spec in specs:
+            if isinstance(spec, Processor):
+                processors.append(deepcopy(spec))
+            else:
+                processor = spec()
+                if not isinstance(processor, Processor):
+                    raise ProcessorValidationError("Metric factory must return a Processor")
+                processors.append(processor)
+        return processors
+
+    @staticmethod
+    def _fresh_context(context: ProcessingContext) -> ProcessingContext:
+        metadata = context.metadata.copy()
+        for key in (
+            "metrics",
+            "grid_search",
+            "artifact_template_matrices",
+        ):
+            metadata.custom.pop(key, None)
+
+        raw = context.get_raw().copy()
+        original = context.get_raw_original()
+        return ProcessingContext(
+            raw=raw,
+            # The pipeline mutates only ``raw``. The original recording is
+            # read-only reference data for metrics, so sharing it avoids one
+            # additional full Raw allocation for every parameter combination.
+            raw_original=original if original is not None else context.get_raw(),
+            metadata=metadata,
+        )
+
+    def _validate_configuration(self) -> None:
+        if self.upsample_factor < 1:
+            raise ProcessorValidationError("upsample_factor must be >= 1")
+        if not isinstance(self.track_estimated_noise, bool):
+            raise ProcessorValidationError("track_estimated_noise must be a boolean")
+        if any(value < 1 for value in self.window_sizes):
+            raise ProcessorValidationError("window_sizes must be >= 1")
+        if any(not 0 < value <= 1 for value in self.thresholds):
+            raise ProcessorValidationError("thresholds must be in (0, 1]")
+        if any(value < 1 for value in self.min_accepted_values):
+            raise ProcessorValidationError("min_accepted_values must be >= 1")
+        if any(value not in {"equal", "normal"} for value in self.N_distributions):
+            raise ProcessorValidationError("N_distributions must contain only 'equal' or 'normal'")
+        if any(value <= 0 for value in self.search_window_factors):
+            raise ProcessorValidationError("search_window_factors must be positive")
+        if not self.iter_parameter_grid():
+            raise ProcessorValidationError("No valid combinations: min_accepted must be <= window_size")
+        self._resolve_objective_directions()
+
+    def _resolve_objective_directions(self) -> None:
+        if len(self.pareto_objectives) < 2:
+            raise ProcessorValidationError("Pareto analysis requires at least two objectives")
+        for name, direction in self.pareto_objectives.items():
+            _normalize_direction(direction, name=str(name))
+
+    @staticmethod
+    def _configuration_id(params: Mapping[str, Any]) -> str:
+        serializable = {key: _python_scalar(value) for key, value in sorted(params.items())}
+        return json.dumps(serializable, sort_keys=True, separators=(",", ":"))
+
+    @staticmethod
+    def _metric_columns(results: pd.DataFrame) -> list[str]:
+        excluded = {
+            "dataset_id",
+            "configuration_id",
+            *FLEX_PARAMETER_NAMES,
+            "success",
+            "execution_time",
+            "error",
+        }
+        return [column for column in results.columns if column not in excluded]
+
+    @staticmethod
+    def _flatten_metrics(metrics: Mapping[str, Any]) -> dict[str, float]:
+        flat: dict[str, float] = {}
+
+        def walk(prefix: str, value: Any) -> None:
+            if _is_finite_number(value):
+                flat[prefix] = float(value)
+            elif isinstance(value, Mapping):
+                for key, nested in value.items():
+                    walk(f"{prefix}_{key}", nested)
+            elif isinstance(value, (list, tuple, np.ndarray)):
+                array = np.asarray(value, dtype=float)
+                if array.size and np.all(np.isfinite(array)):
+                    flat[f"{prefix}_mean"] = float(array.mean())
+                    flat[f"{prefix}_std"] = float(array.std())
+
+        for key, value in metrics.items():
+            walk(str(key), value)
+        return flat
+
+    @staticmethod
+    def _infer_dataset_id(context: ProcessingContext) -> str:
+        custom = context.metadata.custom
+        for key in ("dataset_id", "subject", "input_path", "source_path"):
+            if custom.get(key):
+                return str(custom[key])
+        return "dataset"
+
+    @staticmethod
+    def _write_csv(frame: pd.DataFrame, path: Path | None) -> Path | None:
+        if path is None:
+            return None
+        path.parent.mkdir(parents=True, exist_ok=True)
+        frame.to_csv(path, index=False)
+        logger.info("Saved grid-search output to {}", path)
+        return path
+
+    def _get_parameters(self) -> dict[str, Any]:
+        specs = self._metric_processor_specs or DEFAULT_METRIC_FACTORIES
+        metric_names = [
+            spec.__class__.__name__ if isinstance(spec, Processor) else getattr(spec, "__name__", repr(spec))
+            for spec in specs
+        ]
+        return {
+            "trigger_regex": self.trigger_regex,
+            "upsample_factor": self.upsample_factor,
+            "outputs": {
+                "results": _path_to_string(self.output_csv),
+                "aggregate": _path_to_string(self.output_aggregate_csv),
+                "parameter_effects": _path_to_string(self.output_parameter_effects_csv),
+                "pareto": _path_to_string(self.output_pareto_csv),
+                "combination_grid": _path_to_string(self.output_combination_grid_csv),
+                "pareto_2d": _path_to_string(self.output_pareto_2d),
+                "pareto_3d": _path_to_string(self.output_pareto_3d),
+                "pareto_matrix": _path_to_string(self.output_pareto_matrix),
+                "combination_heatmap": _path_to_string(self.output_combination_heatmap),
+                "parameter_effects_plot": _path_to_string(self.output_parameter_effects_plot),
+            },
+            "pareto_objectives": dict(self.pareto_objectives),
+            "parameter_effect_metric": self.parameter_effect_metric,
+            "parameter_effect_direction": self.parameter_effect_direction,
+            "search_space": {
+                "window_sizes": list(self.window_sizes),
+                "thresholds": list(self.thresholds),
+                "min_accepted_values": list(self.min_accepted_values),
+                "N_distributions": list(self.N_distributions),
+                "realign_after_averaging_values": list(self.realign_after_averaging_values),
+                "search_window_factors": list(self.search_window_factors),
+                "interpolate_volume_gaps_values": list(self.interpolate_volume_gaps_values),
+                "apply_epoch_alpha_scaling_values": list(self.apply_epoch_alpha_scaling_values),
+            },
+            "metric_processors": metric_names,
+            "track_estimated_noise": self.track_estimated_noise,
+            "continue_on_error": self.continue_on_error,
+            "show_progress": self.show_progress,
+        }
+
+
+def _optional_path(value: str | Path | None) -> Path | None:
+    return Path(value) if value is not None else None
+
+
+def _path_to_string(value: Path | None) -> str | None:
+    return str(value) if value is not None else None
+
+
+def _normalize_direction(value: str, *, name: str) -> ObjectiveDirection:
+    normalized = str(value).lower()
+    if normalized not in {"min", "max"}:
+        raise ProcessorValidationError(f"Direction for {name!r} must be 'min' or 'max', got {value!r}")
+    return normalized  # type: ignore[return-value]
+
+
+def _is_finite_number(value: Any) -> bool:
+    return isinstance(value, (int, float, np.number)) and not isinstance(value, bool) and np.isfinite(value)
+
+
+def _python_scalar(value: Any) -> Any:
+    return value.item() if isinstance(value, np.generic) else value
+
+
+def _nice_tick_positions(length: int, *, max_ticks: int) -> np.ndarray:
+    """Return readable integer tick positions for a potentially dense axis."""
+    if length <= max_ticks:
+        return np.arange(length)
+    return np.unique(np.linspace(0, length - 1, max_ticks, dtype=int))
+
+
+def _as_int_tuple(values: Sequence[int], *, name: str) -> tuple[int, ...]:
+    output = tuple(int(value) for value in values)
+    if not output:
+        raise ValueError(f"{name} must not be empty")
+    return output
+
+
+def _as_float_tuple(
+    values: Sequence[float],
+    *,
+    name: str,
+) -> tuple[float, ...]:
+    output = tuple(float(value) for value in values)
+    if not output:
+        raise ValueError(f"{name} must not be empty")
+    return output
+
+
+def _as_string_tuple(
+    values: Sequence[str],
+    *,
+    name: str,
+) -> tuple[str, ...]:
+    output = tuple(str(value).strip().lower() for value in values)
+    if not output:
+        raise ValueError(f"{name} must not be empty")
+    return output
+
+
+def _as_bool_tuple(
+    values: Sequence[bool],
+    *,
+    name: str,
+) -> tuple[bool, ...]:
+    output: list[bool] = []
+    for value in values:
+        if not isinstance(value, (bool, np.bool_)):
+            raise ValueError(f"{name} must contain only booleans")
+        output.append(bool(value))
+    if not output:
+        raise ValueError(f"{name} must not be empty")
+    return tuple(output)
+
+
+def _save_figure(fig: plt.Figure, path: Path) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fig.savefig(path, dpi=180)
+    plt.close(fig)

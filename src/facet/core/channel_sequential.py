@@ -6,6 +6,7 @@ completely independent of multiprocessing parallelism.
 """
 
 import time
+from copy import copy, deepcopy
 
 import mne
 import numpy as np
@@ -127,7 +128,10 @@ class ChannelSequentialExecutor:
                     metadata_states = [self._metadata_for_replay(ch_ctx.metadata)]
                 for pi, proc in enumerate(processors):
                     if k > 0 and pi < len(metadata_states):
-                        ch_ctx = ch_ctx.with_metadata(metadata_states[pi].copy())
+                        ch_ctx = ch_ctx.with_metadata(
+                            metadata_states[pi].copy(),
+                            copy_estimated_noise=False,
+                        )
                     before_counts = self._custom_list_lengths(ch_ctx, MERGED_LIST_METADATA_KEYS)
                     skipped = proc.run_once and proc.name in _run_once_executed
                     console.channel_processor_started(k, pi)
@@ -181,16 +185,21 @@ class ChannelSequentialExecutor:
         # --- pass-through channels (stim, misc, ...) -------------------------
         if passthrough_idx:
             if n_times_out == raw.n_times:
-                orig = raw.get_data()
-                for i in passthrough_idx:
-                    merged_data[i] = orig[i]
+                passthrough_data = raw.get_data(picks=passthrough_idx)
+                for source_index, output_index in enumerate(passthrough_idx):
+                    merged_data[output_index] = passthrough_data[source_index]
             else:
-                picks = [ch_names[i] for i in passthrough_idx]
-                pt_raw = raw.copy().pick(picks)
+                passthrough_data = raw.get_data(picks=passthrough_idx)
+                passthrough_info = mne.pick_info(raw.info, passthrough_idx)
+                with suppress_stdout():
+                    pt_raw = mne.io.RawArray(
+                        passthrough_data,
+                        passthrough_info,
+                    )
                 with suppress_stdout():
                     pt_raw.resample(new_sfreq)
                 for j, i in enumerate(passthrough_idx):
-                    merged_data[i] = pt_raw.get_data()[j]
+                    merged_data[i] = pt_raw._data[j]
                 del pt_raw
 
         # --- build merged output context -------------------------------------
@@ -204,10 +213,12 @@ class ChannelSequentialExecutor:
         with suppress_stdout():
             new_raw = mne.io.RawArray(merged_data, info)
 
-        result = context.with_raw(new_raw)
+        result = context.with_raw(
+            new_raw,
+            estimated_noise=(noise_data if handle_noise and noise_data is not None else None),
+            copy_estimated_noise=False,
+        )
         result._metadata = saved_metadata
-        if handle_noise and noise_data is not None:
-            result.set_estimated_noise(noise_data)
         return result
 
     # ---------------------------------------------------------------------- #
@@ -259,9 +270,11 @@ class ChannelSequentialExecutor:
     @staticmethod
     def _metadata_for_replay(metadata):
         """Copy metadata used for later channels without bulky reports."""
-        replay = metadata.copy()
-        for key in MERGED_LIST_METADATA_KEYS:
-            replay.custom.pop(key, None)
+        replay = copy(metadata)
+        replay.triggers = metadata.triggers.copy() if metadata.triggers is not None else None
+        replay.custom = deepcopy(
+            {key: value for key, value in metadata.custom.items() if key not in MERGED_LIST_METADATA_KEYS}
+        )
         return replay
 
     @staticmethod
@@ -294,16 +307,17 @@ class ChannelSequentialExecutor:
         info = mne.pick_info(raw.info, [ch_idx])
         with suppress_stdout():
             subset_raw = mne.io.RawArray(data, info)
-        subset_ctx = context.with_raw(subset_raw)
-
-        # with_raw() copies the full noise matrix; keep only the active channel.
-        subset_ctx._estimated_noise = None
+        subset_noise = None
         if context.has_estimated_noise():
             noise = context.get_estimated_noise()
             if noise is not None and noise.ndim == 2:
                 if noise.shape[0] == 1:
-                    subset_ctx.set_estimated_noise(noise.copy())
+                    subset_noise = noise.copy()
                 elif ch_idx < noise.shape[0]:
-                    subset_ctx.set_estimated_noise(noise[ch_idx : ch_idx + 1].copy())
+                    subset_noise = noise[ch_idx : ch_idx + 1].copy()
 
-        return subset_ctx
+        return context.with_raw(
+            subset_raw,
+            estimated_noise=subset_noise,
+            copy_estimated_noise=False,
+        )

@@ -289,11 +289,36 @@ Correction modes choose the main template-subtraction strategy:
 ```bash
 --correction-mode aas
 --correction-mode farm
+--correction-mode flex
 --correction-mode volume-trigger
 --correction-mode slice-trigger
 --correction-mode corresponding-slice
 --correction-mode moosmann
 ```
+
+Flex exposes the correlation-based choices directly: `--window-size` sets the
+non-target candidate window, `--flex-threshold` selects correlated epochs,
+`--flex-min-accepted` supplements that selection when too few pass, and
+`--flex-distribution equal|normal` controls their averaging weights.
+
+All template-subtraction modes use the engine implemented by `Flex`, which
+inherits directly from `Processor`. For each channel, the engine extracts the
+epoch data matrix `D`, asks the selected strategy to construct its averaging
+matrix `A`, calculates the artifact templates as `N = A @ D`, and subtracts
+the corresponding row of `N` at each trigger. `AASCorrection`,
+`FARMCorrection`, `CorrespondingSliceCorrection`, `VolumeTriggerCorrection`,
+`SliceTriggerCorrection`, and `MoosmannCorrection` are direct `Flex`
+subclasses retained as compatibility strategies for their established matrix
+rules and constructor APIs.
+
+The four Flex controls configure Flex's native future-first correlation
+strategy; they do not exactly reproduce every legacy matrix rule. The
+compatibility subclasses remain the explicit way to request those rules while
+the API evolves toward named Flex strategies or presets. `ANCCorrection`,
+`PCACorrection`, and `VolumeArtifactCorrection` remain independent processors:
+they perform adaptive filtering, PCA reconstruction, and volume-transition
+correction respectively, rather than building artifact templates with
+`N = A @ D`.
 
 Add-on modes are layered around the selected correction mode and can be passed
 more than once:
@@ -329,6 +354,17 @@ facetpy-run process \
   --output-dir output/scanner_bcg \
   --pattern quickstart \
   --mode bcg \
+  --overwrite
+
+# Flexible correlation selection with temporal-normal weights
+facetpy-run process \
+  --input raw.edf \
+  --output-dir output/flex \
+  --correction-mode flex \
+  --window-size 30 \
+  --flex-threshold 0.95 \
+  --flex-min-accepted 8 \
+  --flex-distribution normal \
   --overwrite
 
 # Motion-informed Moosmann weighting
@@ -370,8 +406,10 @@ Useful memory and chunk controls:
 
 ```bash
 --channel-sequential / --no-channel-sequential
---memory-budget-mb 4096
+--max-memory-mb 4096
 --memory-fraction 0.5
+--disable-chunking
+--force-full-run
 --trigger-section-padding-seconds 10
 --trigger-section-min-triggers 16
 --trigger-section-gap-seconds 30
@@ -382,6 +420,16 @@ Useful memory and chunk controls:
 upsampling-heavy pipelines because high-memory correction stages run one
 channel at a time.
 
+Trigger-section planning never reduces Flex's required trigger count. When the
+normal estimate is smaller than that context, FACETpy enlarges only to the
+smallest valid trigger-aligned window that fits safely in currently available
+RAM. Computational windows may overlap for correction context, while each
+output contains only its non-overlapping core. `--disable-chunking` requests
+one checked full-run window; `--force-full-run` bypasses that safety refusal
+and should be used only when the memory estimate is known to be conservative.
+The older `--memory-budget-mb` spelling remains an alias for
+`--max-memory-mb`.
+
 ### Process outputs and reports
 
 Each successful `process` output folder includes corrected chunk files and
@@ -391,7 +439,7 @@ JSON metadata:
 |---|---|
 | `chunks_manifest.json` | Source path, chunk windows, output files, runtime, success/error per chunk |
 | `pipeline_description.json` | Pattern, correction mode, BCG mode status, add-on modes, processor list, parameters, output paths |
-| `artifact_template_matrices.json` | AAS-style `N = A @ D` reports: epoch matrix `D`, averaging matrix `A`, and artifact-template matrix `N` preview |
+| `artifact_template_matrices.json` | Flex-engine `N = A @ D` reports: epoch matrix `D`, averaging matrix `A`, and artifact-template matrix `N` preview |
 
 If a recording fails and `--on-error continue` is used, FACETpy writes
 `processing_error.json` in that recording's output folder and
@@ -464,6 +512,23 @@ facetpy-run to-bids \
 BIDS labels can be provided explicitly with `--subject`, `--session`, and
 `--task`; otherwise, the CLI derives subject/run values from the corrected file
 names.
+
+To convert an existing BIDS dataset in the other direction, use the dedicated
+command:
+
+```bash
+facetpy-convert-bids \
+  --bids-root /path/to/bids_dataset \
+  --output-dir /path/to/edf_output
+```
+
+The command recursively discovers supported recordings inside `eeg/`
+directories in EEGLAB (`.set`), BrainVision (`.vhdr`), EDF, BDF, and FIF
+format. Sidecars are matched from the recording stem: `_events.tsv` supplies
+EDF+ annotations, `_channels.tsv` supplies channel types and bad-channel
+status, and `_eeg.json` supplies portable recording metadata such as line
+frequency. Unsupported or incomplete recordings are reported and skipped
+without stopping the remaining conversions.
 
 ### Setup notes for CLI users
 
@@ -568,7 +633,7 @@ src/facet/
 ├── core/           Pipeline, Processor, ProcessingContext, BatchResult
 ├── io/             Loader, BIDSLoader, EDFExporter, BIDSExporter
 ├── preprocessing/  Filters, Resample, TriggerDetector, Alignment, Transforms
-├── correction/     AASCorrection, PCACorrection, ANCCorrection
+├── correction/     Flex template strategies, PCA, ANC, volume transitions
 ├── evaluation/     SNRCalculator, RMSCalculator, MetricsReport, RawPlotter
 ├── misc/           EEGGenerator (synthetic data)
 └── pipelines.py    create_standard_pipeline() factory

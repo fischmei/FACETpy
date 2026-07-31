@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from .core import Pipeline
-from .correction import AASCorrection
+from .correction import AASCorrection, CorrectionGridSearch
 from .evaluation import (
     FFTAllenCalculator,
     FFTNiazyCalculator,
@@ -147,3 +147,34 @@ def create_standard_pipeline(
         processors.append(RawPlotter(**(plot_kwargs or {})))
 
     return Pipeline(processors, name="Standard fMRI Correction Pipeline")
+
+
+def create_correction_grid_search_pipeline(
+    input_path: str,
+    output_csv: str = "facet_grid_search_results.csv",
+    trigger_regex: str = r"\b1\b",
+    artifact_to_trigger_offset: float = -0.005,
+    upsample_factor: int = 10,
+    output_score_grid_csv: str | None = None,
+    output_diagram: str | None = None,
+    **grid_search_kwargs,
+) -> Pipeline:
+    """Create a lazy AAS/FARM correction grid-search pipeline.
+
+    The search processor evaluates each combination using this internal order:
+    ``TriggerDetector -> UpSample -> AAS/FARM -> DownSample``. Evaluation
+    metrics are appended after downsampling and exported to CSV when the
+    returned pipeline is run.
+    """
+    processors = [
+        Loader(path=input_path, preload=True, artifact_to_trigger_offset=artifact_to_trigger_offset),
+        CorrectionGridSearch(
+            trigger_regex=trigger_regex,
+            upsample_factor=upsample_factor,
+            output_csv=output_csv,
+            output_score_grid_csv=output_score_grid_csv,
+            output_diagram=output_diagram,
+            **grid_search_kwargs,
+        ),
+    ]
+    return Pipeline(processors, name="AAS/FARM Correction Grid Search")

@@ -78,7 +78,10 @@ class AnalyzeDataReport(Processor):
 
         metadata = context.metadata.copy()
         metadata.custom[self.name] = report
-        return context.with_metadata(metadata)
+        return context.with_metadata(
+            metadata,
+            copy_estimated_noise=False,
+        )
 
 
 @register_processor
@@ -149,7 +152,10 @@ class CheckDataReport(Processor):
 
         metadata = context.metadata.copy()
         metadata.custom[self.name] = report
-        return context.with_metadata(metadata)
+        return context.with_metadata(
+            metadata,
+            copy_estimated_noise=False,
+        )
 
     def _check_triggers(self, context: ProcessingContext, errors: list[str], warnings: list[str]) -> None:
         triggers = np.asarray(context.get_triggers(), dtype=int)

@@ -69,6 +69,12 @@ class ParallelExecutor:
         result_context = executor.execute(processor, context)
     """
 
+    # Multiprocessing has a meaningful fixed cost even before signal arrays
+    # are deserialized. Keeping this estimate explicit makes the automatic
+    # worker cap conservative and easy to adjust as the runtime evolves.
+    _WORKER_BASE_OVERHEAD_BYTES = 64 * 1024**2
+    _AVAILABLE_MEMORY_FRACTION = 0.5
+
     def __init__(self, n_jobs: int = -1, backend: str = "multiprocessing", verbose: bool = True):
         """
         Initialize parallel executor.
@@ -78,6 +84,7 @@ class ParallelExecutor:
             backend: Parallel backend ("multiprocessing", "threading", or "serial")
             verbose: Show progress messages
         """
+        self.requested_n_jobs = n_jobs
         self.n_jobs = self._determine_n_jobs(n_jobs)
         self.backend = backend
         self.verbose = verbose
@@ -137,8 +144,6 @@ class ParallelExecutor:
         Returns:
             Output context with processed channels
         """
-        logger.info(f"Executing {processor.name} in parallel across {self.n_jobs} jobs")
-
         raw = context.get_raw()
         n_channels = len(raw.ch_names)
 
@@ -146,7 +151,18 @@ class ParallelExecutor:
             logger.warning("No channels available for parallel execution")
             return context
 
-        channel_chunks = self._split_into_chunks(list(range(n_channels)), self.n_jobs)
+        worker_count = self._resolve_worker_count(
+            processor=processor,
+            context=context,
+            task_count=n_channels,
+        )
+        logger.info(
+            "Executing {} in parallel across {} job(s)",
+            processor.name,
+            worker_count,
+        )
+
+        channel_chunks = self._split_into_chunks(list(range(n_channels)), worker_count)
 
         progress_total = n_channels if n_channels > 0 else None
         with processor_progress(
@@ -168,6 +184,7 @@ class ParallelExecutor:
                     processor,
                     context,
                     channel_chunks,
+                    worker_count=worker_count,
                     progress_callback=_update_progress,
                 )
             elif self.backend == "threading":
@@ -175,6 +192,7 @@ class ParallelExecutor:
                     processor,
                     context,
                     channel_chunks,
+                    worker_count=worker_count,
                     progress_callback=_update_progress,
                 )
             else:  # serial
@@ -222,20 +240,26 @@ class ParallelExecutor:
         processor: Processor,
         context: ProcessingContext,
         channel_chunks: list[list[int]],
+        worker_count: int | None = None,
         progress_callback: Callable[[int], None] | None = None,
     ) -> list[ProcessingContext]:
-        """Execute using multiprocessing."""
+        """Execute using multiprocessing without retaining every task payload."""
         processor_config = {"class": processor.__class__, "parameters": processor._parameters}
+        processes = worker_count or min(self.n_jobs, max(1, len(channel_chunks)))
 
-        chunk_contexts = []
-        for chunk in channel_chunks:
-            chunk_context = self._create_channel_subset_context(context, chunk)
-            chunk_contexts.append(chunk_context.to_dict())
+        def _serialized_contexts():
+            # ``Pool.imap`` consumes this iterator incrementally. Each selected
+            # channel payload can therefore be released by the parent as soon
+            # as it has been sent to a worker instead of all payloads being
+            # accumulated in a list before the pool starts.
+            for chunk in channel_chunks:
+                chunk_context = self._create_channel_subset_context(context, chunk)
+                yield chunk_context.to_dict()
 
         worker = functools.partial(_worker_function, processor_config)
         contexts: list[ProcessingContext] = []
-        with mp.Pool(processes=self.n_jobs) as pool:
-            for idx, result in enumerate(pool.imap(worker, chunk_contexts)):
+        with mp.Pool(processes=processes) as pool:
+            for idx, result in enumerate(pool.imap(worker, _serialized_contexts(), chunksize=1)):
                 contexts.append(ProcessingContext.from_dict(result))
                 if progress_callback:
                     chunk_size = len(channel_chunks[idx])
@@ -248,13 +272,15 @@ class ParallelExecutor:
         processor: Processor,
         context: ProcessingContext,
         channel_chunks: list[list[int]],
+        worker_count: int | None = None,
         progress_callback: Callable[[int], None] | None = None,
     ) -> list[ProcessingContext]:
         """Execute using threading (GIL-limited)."""
         from concurrent.futures import ThreadPoolExecutor, as_completed
 
         results: list[ProcessingContext] = []
-        with ThreadPoolExecutor(max_workers=self.n_jobs) as executor:
+        max_workers = worker_count or min(self.n_jobs, max(1, len(channel_chunks)))
+        with ThreadPoolExecutor(max_workers=max_workers) as executor:
             futures = {}
             for chunk in channel_chunks:
                 chunk_context = self._create_channel_subset_context(context, chunk)
@@ -288,20 +314,58 @@ class ParallelExecutor:
     def _create_channel_subset_context(
         self, context: ProcessingContext, channel_indices: list[int]
     ) -> ProcessingContext:
-        """Create context with subset of channels."""
+        """Create a context containing only the requested channels.
+
+        ``raw.copy().pick(...)`` first duplicates the complete recording and
+        only then discards unselected channels. Direct extraction keeps the
+        transient allocation proportional to the worker's actual subset while
+        preserving picked channel info, the original sample offset, and
+        annotations.
+        """
         raw = context.get_raw()
-        picks = [raw.ch_names[i] for i in channel_indices]
-        subset_raw = raw.copy().pick(picks)
+        if not channel_indices:
+            raise ValueError("channel_indices must not be empty")
 
-        subset_ctx = context.with_raw(subset_raw, copy_metadata=True)
+        if raw.preload and getattr(raw, "_data", None) is not None:
+            subset_data = raw._data[channel_indices, :]
+        else:
+            subset_data = raw.get_data(picks=channel_indices)
 
+        subset_info = mne.pick_info(raw.info, channel_indices, copy=True)
+        with suppress_stdout():
+            subset_raw = mne.io.RawArray(
+                data=subset_data,
+                info=subset_info,
+                first_samp=raw.first_samp,
+                copy="auto",
+            )
+        if len(raw.annotations):
+            annotations = raw.annotations.copy()
+            if annotations.orig_time is None:
+                # MNE stores no-orig-time annotation onsets with
+                # ``raw.first_time`` already applied. ``set_annotations``
+                # applies it again, so convert back to local onsets first.
+                annotations.onset -= raw.first_time
+            subset_raw.set_annotations(annotations)
+
+        subset_noise = None
+        copy_subset_noise = False
         if context.has_estimated_noise():
             noise = context.get_estimated_noise()
             if noise is not None and noise.ndim == 2:
                 subset_noise = noise[channel_indices, :]
-                subset_ctx.set_estimated_noise(subset_noise.copy())
+            else:
+                # Estimated noise is expected to be channel x sample. Retain
+                # historical behaviour for any non-standard representation.
+                subset_noise = noise
+                copy_subset_noise = True
 
-        return subset_ctx
+        return context.with_raw(
+            subset_raw,
+            copy_metadata=True,
+            estimated_noise=subset_noise,
+            copy_estimated_noise=copy_subset_noise,
+        )
 
     def _merge_channel_results(
         self, original_context: ProcessingContext, results: list[ProcessingContext]
@@ -339,9 +403,7 @@ class ParallelExecutor:
         with suppress_stdout():
             new_raw = mne.io.RawArray(data=merged_data, info=info)
 
-        merged_context = original_context.with_raw(new_raw)
-        merged_context._metadata = results[0].metadata.copy()
-
+        noise_data = None
         if any(result_ctx.has_estimated_noise() for result_ctx in results):
             # Estimated noise is stored channel-wise; merge similarly
             noise_data = np.zeros_like(merged_data)
@@ -353,9 +415,138 @@ class ParallelExecutor:
                 for j, ch_name in enumerate(result_raw.ch_names):
                     ch_idx = channel_index[ch_name]
                     noise_data[ch_idx] = result_noise[j]
-            merged_context.set_estimated_noise(noise_data)
+
+        # Supply the already merged estimate atomically so ``with_raw`` does
+        # not copy the original full noise array only to replace it.
+        merged_context = original_context.with_raw(
+            new_raw,
+            estimated_noise=noise_data,
+            copy_estimated_noise=False,
+        )
+        merged_context._metadata = results[0].metadata.copy()
 
         return merged_context
+
+    def _resolve_worker_count(
+        self,
+        processor: Processor,
+        context: ProcessingContext,
+        task_count: int,
+    ) -> int:
+        """Cap multiprocessing workers using a conservative RAM estimate."""
+        requested = min(self.n_jobs, max(1, task_count))
+        if self.backend != "multiprocessing" or requested <= 1:
+            return requested
+
+        available = self._available_memory_bytes()
+        if available is None:
+            return requested
+
+        memory_limit = max(1, int(available * self._AVAILABLE_MEMORY_FRACTION))
+        for worker_count in range(requested, 0, -1):
+            estimated = self._estimate_parallel_memory(
+                processor=processor,
+                context=context,
+                worker_count=worker_count,
+            )
+            if estimated <= memory_limit:
+                if worker_count < requested:
+                    logger.warning(
+                        "Capping parallel jobs from {} to {}: estimated {:.2f} GiB "
+                        "fits the {:.2f} GiB worker-memory allowance",
+                        requested,
+                        worker_count,
+                        estimated / 1024**3,
+                        memory_limit / 1024**3,
+                    )
+                return worker_count
+
+        estimated_one = self._estimate_parallel_memory(
+            processor=processor,
+            context=context,
+            worker_count=1,
+        )
+        logger.warning(
+            "One worker is estimated to require {:.2f} GiB, above the {:.2f} GiB "
+            "worker-memory allowance; continuing serially because the worker "
+            "count cannot be reduced further",
+            estimated_one / 1024**3,
+            memory_limit / 1024**3,
+        )
+        return 1
+
+    @classmethod
+    def _estimate_parallel_memory(
+        cls,
+        processor: Processor,
+        context: ProcessingContext,
+        worker_count: int,
+    ) -> int:
+        """Estimate aggregate child-process memory for channel-wise work.
+
+        The estimate accounts for selected-channel input/output payloads,
+        common processor copies/intermediates, the largest sample-rate
+        expansion of the current processor, and a fixed interpreter/library
+        cost for every spawned worker.
+        """
+        raw = context.get_raw()
+        n_channels = max(1, len(raw.ch_names))
+        channels_per_worker = (n_channels + worker_count - 1) // worker_count
+
+        signal_bytes = cls._raw_nbytes(raw)
+        if context.has_estimated_noise():
+            noise = context.get_estimated_noise()
+            if noise is not None:
+                signal_bytes += int(noise.nbytes)
+
+        bytes_per_channel = (signal_bytes + n_channels - 1) // n_channels
+        worker_input_bytes = bytes_per_channel * channels_per_worker
+        expansion = cls._processor_sample_expansion(processor, context)
+
+        # Input serialization/deserialization plus a processor-owned copy and
+        # expanded output/intermediate storage. This intentionally errs on the
+        # conservative side; numerical processing itself is unchanged.
+        worker_signal_bytes = worker_input_bytes * (2.0 + 2.0 * expansion)
+        per_worker = cls._WORKER_BASE_OVERHEAD_BYTES + int(worker_signal_bytes)
+        return max(1, worker_count) * per_worker
+
+    @staticmethod
+    def _raw_nbytes(raw) -> int:
+        """Return Raw signal bytes without materializing a lazy recording."""
+        data = getattr(raw, "_data", None)
+        if raw.preload and data is not None:
+            return int(data.nbytes)
+
+        dtype = getattr(raw, "_dtype", np.float64)
+        try:
+            sample_bytes = np.dtype(dtype).itemsize
+        except TypeError:
+            sample_bytes = np.dtype(np.float64).itemsize
+        return int(len(raw.ch_names) * raw.n_times * sample_bytes)
+
+    @staticmethod
+    def _processor_sample_expansion(
+        processor: Processor,
+        context: ProcessingContext,
+    ) -> float:
+        """Estimate the processor's peak sample-count expansion."""
+        if processor.name == "upsample" and hasattr(processor, "factor"):
+            return max(1.0, float(processor.factor))
+        if processor.name == "resample" and hasattr(processor, "sfreq"):
+            return max(1.0, float(processor.sfreq) / context.get_sfreq())
+        return 1.0
+
+    @staticmethod
+    def _available_memory_bytes() -> int | None:
+        """Return available physical memory without requiring psutil."""
+        import os
+
+        try:
+            pages = os.sysconf("SC_AVPHYS_PAGES")
+            page_size = os.sysconf("SC_PAGE_SIZE")
+        except (AttributeError, OSError, ValueError):
+            return None
+        return max(1, int(pages * page_size))
 
     def _merge_epoch_results(
         self, original_context: ProcessingContext, results: list[ProcessingContext]

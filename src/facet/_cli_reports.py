@@ -78,7 +78,7 @@ def _chunked_results(chunked_result) -> list:
 
 
 def _collect_artifact_template_reports(chunked_result) -> list[dict]:
-    """Collect AAS-style template matrix reports from successful chunk contexts."""
+    """Collect Flex template-matrix reports from successful chunk contexts."""
     chunks = list(getattr(chunked_result, "chunks", []))
     reports: list[dict] = []
 
@@ -112,14 +112,14 @@ def _write_artifact_template_matrix_report(target_dir: Path, input_path: Path, c
     payload = {
         "source_path": str(input_path),
         "description": (
-            "AAS-style corrections build artifact templates with N = A @ D. "
+            "Flex-based corrections build artifact templates with N = A @ D. "
             "D is the epoch data matrix, A is the averaging matrix, and N is the estimated artifact template matrix."
         ),
         "report_count": len(reports),
         "reports": reports,
     }
     if not reports:
-        payload["note"] = "No AAS-style artifact template matrix report was produced for this run."
+        payload["note"] = "No Flex template-matrix report was produced for this run."
 
     report_path.write_text(json.dumps(_json_safe(payload), indent=2), encoding="utf-8")
     return report_path
@@ -158,10 +158,7 @@ def _write_pipeline_description(
             for key, value in vars(args).items()
             if key not in {"func", "input", "input_list", "input_dir"}
         },
-        "processors": [
-            _processor_report(processor, index)
-            for index, processor in enumerate(pipeline.processors, 1)
-        ],
+        "processors": [_processor_report(processor, index) for index, processor in enumerate(pipeline.processors, 1)],
         "result": {
             "success": bool(chunked_result.was_successful()),
             "execution_time_seconds": float(getattr(chunked_result, "execution_time", 0.0)),
@@ -171,10 +168,7 @@ def _write_pipeline_description(
                 else None
             ),
             "artifact_template_matrix_report": str(matrix_report_path),
-            "chunks": [
-                _chunk_report(chunk, result)
-                for chunk, result in zip(chunks, results, strict=False)
-            ],
+            "chunks": [_chunk_report(chunk, result) for chunk, result in zip(chunks, results, strict=False)],
         },
     }
 

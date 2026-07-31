@@ -101,7 +101,7 @@ class Filter(Processor):
         )
 
         # --- NOISE ---
-        new_ctx = context.with_raw(raw)
+        estimated_noise = None
         if context.has_estimated_noise():
             noise = context.get_estimated_noise().copy()
             with suppress_stdout():
@@ -116,12 +116,16 @@ class Filter(Processor):
                 fir_window=self.fir_window,
                 verbose=False,
             )
-            new_ctx.set_estimated_noise(noise_raw.get_data())
+            estimated_noise = noise_raw._data
         else:
             logger.debug("No noise estimate present — skipping noise propagation")
 
         # --- RETURN ---
-        return new_ctx
+        return context.with_raw(
+            raw,
+            estimated_noise=estimated_noise,
+            copy_estimated_noise=False,
+        )
 
 
 @register_processor
@@ -381,7 +385,7 @@ class NotchFilter(Processor):
         )
 
         # --- NOISE ---
-        new_ctx = context.with_raw(raw)
+        estimated_noise = None
         if context.has_estimated_noise():
             noise = context.get_estimated_noise().copy()
             with suppress_stdout():
@@ -396,9 +400,13 @@ class NotchFilter(Processor):
                 fir_window=self.fir_window,
                 verbose=False,
             )
-            new_ctx.set_estimated_noise(noise_raw.get_data())
+            estimated_noise = noise_raw._data
         else:
             logger.debug("No noise estimate present — skipping noise propagation")
 
         # --- RETURN ---
-        return new_ctx
+        return context.with_raw(
+            raw,
+            estimated_noise=estimated_noise,
+            copy_estimated_noise=False,
+        )

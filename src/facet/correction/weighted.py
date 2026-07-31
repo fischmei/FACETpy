@@ -7,11 +7,11 @@ from loguru import logger
 
 from ..core import ProcessingContext, ProcessorValidationError, register_processor
 from ..helpers.moosmann import calc_weighted_matrix_by_realignment_parameters_file
-from .aas import AASCorrection
+from .flex import Flex
 
 
 @register_processor
-class CorrespondingSliceCorrection(AASCorrection):
+class CorrespondingSliceCorrection(Flex):
     """AAS with corresponding-slice averaging across volumes.
 
     This implements MATLAB FACET's ``AvgArtWghtCorrespondingSlice`` rule:
@@ -48,21 +48,36 @@ class CorrespondingSliceCorrection(AASCorrection):
         realign_after_averaging: bool = True,
         search_window_factor: float = 3.0,
         apply_epoch_alpha_scaling: bool = False,
+        track_estimated_noise: bool = True,
     ) -> None:
         self.slices_per_volume = slices_per_volume
         self._runtime_slices_per_volume: int | None = None
         super().__init__(
             window_size=window_size,
-            rel_window_position=0.0,
-            correlation_threshold=0.975,
+            threshold=0.975,
+            min_accepted=1,
+            N_distribution="equal",
             plot_artifacts=plot_artifacts,
             realign_after_averaging=realign_after_averaging,
             search_window_factor=search_window_factor,
             apply_epoch_alpha_scaling=apply_epoch_alpha_scaling,
+            track_estimated_noise=track_estimated_noise,
         )
 
-    def validate(self, context: ProcessingContext) -> None:
-        super().validate(context)
+    def _get_parameters(self) -> dict[str, object]:
+        """Return constructor-compatible corresponding-slice parameters."""
+        return {
+            "slices_per_volume": self.slices_per_volume,
+            "window_size": self.window_size,
+            "plot_artifacts": self.plot_artifacts,
+            "realign_after_averaging": self.realign_after_averaging,
+            "search_window_factor": self.search_window_factor,
+            "apply_epoch_alpha_scaling": self.apply_epoch_alpha_scaling,
+            "track_estimated_noise": self.track_estimated_noise,
+        }
+
+    def _validate_averaging_strategy(self, context: ProcessingContext) -> None:
+        """Validate the slice-period input used by this matrix strategy."""
         runtime_spv = self._resolve_slices_per_volume(context)
         if runtime_spv < 1:
             raise ProcessorValidationError(f"slices_per_volume must be >= 1, got {runtime_spv}")
@@ -136,7 +151,7 @@ class CorrespondingSliceCorrection(AASCorrection):
 
 
 @register_processor
-class VolumeTriggerCorrection(AASCorrection):
+class VolumeTriggerCorrection(Flex):
     """AAS with MATLAB FACET volume-trigger weighting.
 
     Reproduces ``AvgArtWghtVolumeTrigger`` weighting for volume/section trigger
@@ -168,16 +183,34 @@ class VolumeTriggerCorrection(AASCorrection):
         realign_after_averaging: bool = True,
         search_window_factor: float = 3.0,
         apply_epoch_alpha_scaling: bool = False,
+        track_estimated_noise: bool = True,
     ) -> None:
         super().__init__(
             window_size=window_size,
-            rel_window_position=0.0,
-            correlation_threshold=0.975,
+            threshold=0.975,
+            min_accepted=1,
+            N_distribution="equal",
             plot_artifacts=plot_artifacts,
             realign_after_averaging=realign_after_averaging,
             search_window_factor=search_window_factor,
             apply_epoch_alpha_scaling=apply_epoch_alpha_scaling,
+            track_estimated_noise=track_estimated_noise,
         )
+
+    def _get_parameters(self) -> dict[str, object]:
+        """Return constructor-compatible volume-trigger parameters."""
+        return {
+            "window_size": self.window_size,
+            "plot_artifacts": self.plot_artifacts,
+            "realign_after_averaging": self.realign_after_averaging,
+            "search_window_factor": self.search_window_factor,
+            "apply_epoch_alpha_scaling": self.apply_epoch_alpha_scaling,
+            "track_estimated_noise": self.track_estimated_noise,
+        }
+
+    def _validate_averaging_strategy(self, context: ProcessingContext) -> None:
+        """Skip correlation-selection checks unused by fixed volume weights."""
+        del context
 
     def _calc_averaging_matrix(
         self,
@@ -216,7 +249,7 @@ class VolumeTriggerCorrection(AASCorrection):
 
 
 @register_processor
-class SliceTriggerCorrection(AASCorrection):
+class SliceTriggerCorrection(Flex):
     """AAS with MATLAB FACET slice-trigger odd/even template weighting.
 
     Reproduces ``AvgArtWghtSliceTrigger`` behavior by constructing one
@@ -249,16 +282,34 @@ class SliceTriggerCorrection(AASCorrection):
         realign_after_averaging: bool = True,
         search_window_factor: float = 3.0,
         apply_epoch_alpha_scaling: bool = False,
+        track_estimated_noise: bool = True,
     ) -> None:
         super().__init__(
             window_size=window_size,
-            rel_window_position=0.0,
-            correlation_threshold=0.975,
+            threshold=0.975,
+            min_accepted=1,
+            N_distribution="equal",
             plot_artifacts=plot_artifacts,
             realign_after_averaging=realign_after_averaging,
             search_window_factor=search_window_factor,
             apply_epoch_alpha_scaling=apply_epoch_alpha_scaling,
+            track_estimated_noise=track_estimated_noise,
         )
+
+    def _get_parameters(self) -> dict[str, object]:
+        """Return constructor-compatible slice-trigger parameters."""
+        return {
+            "window_size": self.window_size,
+            "plot_artifacts": self.plot_artifacts,
+            "realign_after_averaging": self.realign_after_averaging,
+            "search_window_factor": self.search_window_factor,
+            "apply_epoch_alpha_scaling": self.apply_epoch_alpha_scaling,
+            "track_estimated_noise": self.track_estimated_noise,
+        }
+
+    def _validate_averaging_strategy(self, context: ProcessingContext) -> None:
+        """Skip correlation-selection checks unused by odd/even weights."""
+        del context
 
     def _calc_averaging_matrix(
         self,
@@ -301,7 +352,7 @@ class SliceTriggerCorrection(AASCorrection):
 
 
 @register_processor
-class MoosmannCorrection(AASCorrection):
+class MoosmannCorrection(Flex):
     """AAS with motion-informed Moosmann averaging weights.
 
     Uses the realignment-parameter-informed weighting strategy from
@@ -343,6 +394,7 @@ class MoosmannCorrection(AASCorrection):
         realign_after_averaging: bool = True,
         search_window_factor: float = 3.0,
         apply_epoch_alpha_scaling: bool = False,
+        track_estimated_noise: bool = True,
     ) -> None:
         self.rp_file = rp_file
         self.motion_threshold = motion_threshold
@@ -351,16 +403,34 @@ class MoosmannCorrection(AASCorrection):
         self._last_motion_summary: dict | None = None
         super().__init__(
             window_size=window_size,
-            rel_window_position=0.0,
-            correlation_threshold=0.975,
+            threshold=0.975,
+            min_accepted=1,
+            N_distribution="equal",
             plot_artifacts=plot_artifacts,
             realign_after_averaging=realign_after_averaging,
             search_window_factor=search_window_factor,
             apply_epoch_alpha_scaling=apply_epoch_alpha_scaling,
+            track_estimated_noise=track_estimated_noise,
         )
 
-    def validate(self, context: ProcessingContext) -> None:
-        super().validate(context)
+    def _get_parameters(self) -> dict[str, object]:
+        """Return constructor-compatible motion-weighting parameters."""
+        return {
+            "rp_file": self.rp_file,
+            "window_size": self.window_size,
+            "motion_threshold": self.motion_threshold,
+            "motion_window_size": self.motion_window_size,
+            "plot_artifacts": self.plot_artifacts,
+            "realign_after_averaging": self.realign_after_averaging,
+            "search_window_factor": self.search_window_factor,
+            "apply_epoch_alpha_scaling": self.apply_epoch_alpha_scaling,
+            "track_estimated_noise": self.track_estimated_noise,
+        }
+
+    def _validate_averaging_strategy(self, context: ProcessingContext) -> None:
+        """Validate motion-weighting settings without Flex-only constraints."""
+        del context
+
         if not self.rp_file:
             raise ProcessorValidationError("rp_file must be provided for MoosmannCorrection.")
         if self.motion_threshold <= 0:
@@ -375,7 +445,10 @@ class MoosmannCorrection(AASCorrection):
 
         md = result.metadata.copy()
         md.custom["moosmann"] = self._last_motion_summary
-        return result.with_metadata(md)
+        return result.with_metadata(
+            md,
+            copy_estimated_noise=False,
+        )
 
     def _calc_averaging_matrix(
         self,

@@ -91,23 +91,8 @@ class Resample(Processor):
 
         raw.resample(sfreq=target_sfreq, npad=self.npad, window=self.window, n_jobs=self.n_jobs, verbose=self.verbose)
 
-        # --- BUILD RESULT ---
-        new_ctx = context.with_raw(raw)
-
-        if context.has_triggers():
-            triggers = context.get_triggers()
-            scale_factor = target_sfreq / old_sfreq
-            new_triggers = (triggers * scale_factor).astype(int)
-            logger.debug("Updated {} trigger positions", len(new_triggers))
-            new_ctx = new_ctx.with_triggers(new_triggers)
-        else:
-            scale_factor = target_sfreq / old_sfreq
-
-        # Keep sample-based metadata (artifact/window bounds) consistent with
-        # the new sampling frequency.
-        new_ctx = self._scale_sample_metadata(new_ctx, scale_factor)
-
         # --- NOISE ---
+        estimated_noise = None
         if context.has_estimated_noise():
             noise = context.get_estimated_noise().copy()
             with suppress_stdout():
@@ -119,9 +104,32 @@ class Resample(Processor):
             noise_raw.resample(
                 sfreq=target_sfreq, npad=self.npad, window=self.window, n_jobs=self.n_jobs, verbose=False
             )
-            new_ctx.set_estimated_noise(noise_raw.get_data())
+            estimated_noise = noise_raw._data
         else:
             logger.debug("No noise estimate present — skipping noise propagation")
+
+        # --- BUILD RESULT ---
+        new_ctx = context.with_raw(
+            raw,
+            estimated_noise=estimated_noise,
+            copy_estimated_noise=False,
+        )
+        scale_factor = target_sfreq / old_sfreq
+
+        if context.has_triggers():
+            triggers = context.get_triggers()
+            new_triggers = (triggers * scale_factor).astype(int)
+            logger.debug("Updated {} trigger positions", len(new_triggers))
+            metadata = new_ctx.metadata.copy()
+            metadata.triggers = new_triggers
+            new_ctx = new_ctx.with_metadata(
+                metadata,
+                copy_estimated_noise=False,
+            )
+
+        # Keep sample-based metadata (artifact/window bounds) consistent with
+        # the new sampling frequency.
+        new_ctx = self._scale_sample_metadata(new_ctx, scale_factor)
 
         # --- RETURN ---
         return new_ctx
@@ -189,7 +197,10 @@ class Resample(Processor):
                 old_art_len,
                 metadata.artifact_length,
             )
-            return context.with_metadata(metadata)
+            return context.with_metadata(
+                metadata,
+                copy_estimated_noise=False,
+            )
 
         return context
 

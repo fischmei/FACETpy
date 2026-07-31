@@ -76,6 +76,7 @@ Documentation Overview
    user_guide/configuration
    user_guide/pipelines
    user_guide/helper_cookbook
+   user_guide/grid_search_validation
    user_guide/mne_integration
    user_guide/processors
    user_guide/parallel_processing

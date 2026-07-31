@@ -25,6 +25,7 @@ from facet import (
 from facet.correction import (
     CorrespondingSliceCorrection,
     FARMCorrection,
+    Flex,
     MoosmannCorrection,
     SliceTriggerCorrection,
     VolumeArtifactCorrection,
@@ -46,6 +47,7 @@ DEFAULT_EGI_DROP_REGEX = r"^E(?:[1-9]|[1-9]\d|1[01]\d|12[0-8])$"
 CORRECTION_MODE_DESCRIPTIONS = {
     "aas": "Baseline Averaged Artifact Subtraction.",
     "farm": "FACET FARM-style template weighting for similar artifact epochs.",
+    "flex": "Flexible correlation selection with a configurable minimum and equal or normal weighting.",
     "volume-trigger": "FACET volume-trigger template weighting.",
     "slice-trigger": "FACET slice-trigger odd/even template weighting.",
     "corresponding-slice": "Average corresponding slice positions across volumes.",
@@ -60,6 +62,10 @@ ADD_ON_MODE_DESCRIPTIONS = {
 CORRECTION_MATRIX_DESCRIPTIONS = {
     "aas": "AAS builds A with correlation-selected epochs from sliding windows.",
     "farm": "FARM builds A from the most correlated neighboring epochs above threshold.",
+    "flex": (
+        "Flex builds each row of A from a future-first correlation window, backfilled with preceding epochs, "
+        "then supplements threshold matches to a configurable minimum and applies equal or normal weights."
+    ),
     "volume-trigger": "Volume-trigger correction builds A from fixed neighboring volume-trigger epochs.",
     "slice-trigger": "Slice-trigger correction builds A from alternating odd/even slice-trigger epochs.",
     "corresponding-slice": "Corresponding-slice correction builds A from the same slice position across volumes.",
@@ -90,9 +96,7 @@ def _parse_pca_components(value: str) -> int | float | str:
             return int(normalized)
         return float(normalized)
     except ValueError as exc:
-        raise argparse.ArgumentTypeError(
-            "PCA components must be an integer, a 0-1 fraction, or 'auto'."
-        ) from exc
+        raise argparse.ArgumentTypeError("PCA components must be an integer, a 0-1 fraction, or 'auto'.") from exc
 
 
 def _unique_modes(modes: Sequence[str] | None) -> list[str]:
@@ -114,13 +118,14 @@ def _selected_add_on_modes(args: argparse.Namespace) -> tuple[list[str], bool]:
 
 
 def _common_template_kwargs(args: argparse.Namespace) -> dict:
-    """Build shared options for AAS-style template subtraction processors."""
+    """Build options shared by Flex template-matrix processors."""
     return {
         "window_size": args.window_size,
         "plot_artifacts": args.plot_artifacts,
         "realign_after_averaging": args.realign_after_averaging,
         "search_window_factor": args.search_window_factor,
         "apply_epoch_alpha_scaling": args.apply_epoch_alpha_scaling,
+        "track_estimated_noise": args.track_estimated_noise,
     }
 
 
@@ -141,6 +146,14 @@ def _build_template_correction(args: argparse.Namespace):
             correlation_threshold=args.farm_correlation_threshold,
             search_half_window=args.farm_search_half_window,
             search_half_window_factor=args.farm_search_half_window_factor,
+            interpolate_volume_gaps=args.interpolate_volume_gaps,
+        )
+    if mode == "flex":
+        return Flex(
+            **common,
+            threshold=args.flex_threshold,
+            min_accepted=args.flex_min_accepted,
+            N_distribution=args.flex_distribution,
             interpolate_volume_gaps=args.interpolate_volume_gaps,
         )
     if mode == "volume-trigger":
@@ -171,6 +184,10 @@ def _build_mode_processors(args: argparse.Namespace) -> tuple[list, list, list]:
     post_template = []
     post_downsample = []
     modes, from_pattern = _selected_add_on_modes(args)
+    if "anc" in modes and not args.track_estimated_noise:
+        raise ValueError(
+            "--no-track-estimated-noise cannot be combined with ANC, which requires the retained artifact estimate."
+        )
 
     for mode in modes:
         if mode == "volume-artifact":
@@ -190,6 +207,7 @@ def _build_mode_processors(args: argparse.Namespace) -> tuple[list, list, list]:
                 PCACorrection(
                     n_components=args.pca_components,
                     hp_freq=args.pca_hp_freq,
+                    track_estimated_noise=args.track_estimated_noise,
                 )
             )
         elif mode == "anc":

@@ -2,6 +2,7 @@
 Tests for Pipeline class.
 """
 
+import numpy as np
 import pytest
 
 from facet.core import Pipeline
@@ -150,6 +151,26 @@ class TestPipelineResult:
         assert result.error is None
         assert result.failed_processor is None
         assert result.execution_time > 0
+
+    def test_release_raw_discards_signal_data_but_retains_summaries(self, sample_context):
+        """Released batch results retain metrics/history without large arrays."""
+        sample_context.set_estimated_noise(np.ones_like(sample_context.get_raw()._data))
+        sample_context.cache_set("derived", np.ones_like(sample_context.get_raw()._data))
+        sample_context.metadata.custom["metrics"] = {"snr": 12.5}
+        sample_context.add_history_entry(processor_name="prepared")
+
+        result = Pipeline([]).run(initial_context=sample_context)
+        metrics = result.metrics.copy()
+        history = result.get_history()
+
+        result.release_raw()
+
+        assert not result.context.has_raw()
+        assert result.context.get_raw_original() is None
+        assert not result.context.has_estimated_noise()
+        assert not result.context.cache_has("derived")
+        assert result.metrics == metrics
+        assert result.get_history() == history
 
     def test_failed_result(self, sample_context):
         """Test attributes of failed result."""

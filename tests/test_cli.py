@@ -92,6 +92,38 @@ def test_process_command_batches_into_recording_folders(monkeypatch, tmp_path):
     assert all("drop_channels_matching" not in call["processor_names"] for call in calls)
 
 
+def test_process_command_forwards_memory_and_full_run_controls(monkeypatch, tmp_path):
+    """CLI memory overrides should reach Pipeline.run_chunked unchanged."""
+    source = tmp_path / "recording.edf"
+    source.touch()
+    captured = {}
+
+    def fake_run_chunked(self, **kwargs):
+        captured.update(kwargs)
+        return _DummyChunkedResult()
+
+    monkeypatch.setattr(Pipeline, "run_chunked", fake_run_chunked)
+
+    status = cli.main(
+        [
+            "process",
+            "--input",
+            str(source),
+            "--output-dir",
+            str(tmp_path / "corrected"),
+            "--max-memory-mb",
+            "4096",
+            "--disable-chunking",
+            "--force-full-run",
+        ]
+    )
+
+    assert status == 0
+    assert captured["max_memory_mb"] == 4096
+    assert captured["disable_chunking"] is True
+    assert captured["force_full_run"] is True
+
+
 def test_process_command_can_opt_in_to_egi_channel_drop(monkeypatch, tmp_path):
     """EGI channel dropping should remain available when explicitly requested."""
     source = tmp_path / "sub-01.mff"
@@ -187,6 +219,48 @@ def test_process_command_builds_selected_correction_modes(monkeypatch, tmp_path)
     assert processors[6].use_c_extension is False
 
 
+def test_process_command_builds_flex_correction(monkeypatch, tmp_path):
+    """Flex-specific CLI options should configure the template processor."""
+    source = tmp_path / "sub-01.mff"
+    source.mkdir()
+
+    captured_processors = []
+
+    def fake_run_chunked(self, **kwargs):
+        captured_processors.append(self.processors)
+        return _DummyChunkedResult()
+
+    monkeypatch.setattr(Pipeline, "run_chunked", fake_run_chunked)
+
+    status = cli.main(
+        [
+            "process",
+            "--input",
+            str(source),
+            "--output-dir",
+            str(tmp_path / "corrected"),
+            "--correction-mode",
+            "flex",
+            "--window-size",
+            "12",
+            "--flex-threshold",
+            "0.91",
+            "--flex-min-accepted",
+            "4",
+            "--flex-distribution",
+            "normal",
+        ]
+    )
+
+    assert status == 0
+    correction = captured_processors[0][2]
+    assert correction.name == "flex_correction"
+    assert correction.window_size == 12
+    assert correction.threshold == 0.91
+    assert correction.min_accepted == 4
+    assert correction.N_distribution == "normal"
+
+
 def test_process_command_writes_pipeline_and_matrix_reports(monkeypatch, tmp_path):
     """Every processed input should receive pipeline and template-matrix JSON."""
     source = tmp_path / "sub-01.mff"
@@ -261,7 +335,7 @@ def test_process_command_writes_pipeline_and_matrix_reports(monkeypatch, tmp_pat
     assert pipeline_payload["bcg_enabled"] is True
     assert pipeline_payload["bcg_selected_as_mode"] is True
     assert pipeline_payload["result"]["artifact_template_matrix_report"].endswith("artifact_template_matrices.json")
-    assert matrix_payload["description"].startswith("AAS-style corrections build artifact templates")
+    assert matrix_payload["description"].startswith("Flex-based corrections build artifact templates")
     assert matrix_payload["reports"][0]["processor_name"] == "aas_correction"
     assert matrix_payload["reports"][0]["chunk"]["index"] == 1
 
@@ -444,8 +518,9 @@ def test_modes_command_lists_cli_modes(capsys):
 
     captured = capsys.readouterr()
     assert status == 0
-    assert "Correction modes replace the baseline AAS" in captured.out
+    assert "Correction modes select the Flex template-subtraction strategy" in captured.out
     assert "farm:" in captured.out
+    assert "flex:" in captured.out
     assert "pca:" in captured.out
     assert "anc:" in captured.out
     assert "bcg:" in captured.out
