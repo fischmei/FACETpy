@@ -7,27 +7,99 @@ Author: FACETpy Team
 Date: 2025-01-12
 """
 
-from .aas import AASCorrection, AveragedArtifactSubtraction
-from .farm import FARMArtifactCorrection, FARMCorrection
-from .flex import Flex, FlexCorrection
+from .flex import (
+    MOTION_METADATA_KEY,
+    AveragingMatrixBuilder,
+    CandidateScoringMode,
+    CandidateScoringPolicy,
+    CorrelationMode,
+    CorrelationPolicy,
+    DirectionalQuota,
+    Flex,
+    FlexCorrection,
+    MatrixDecisionError,
+    MatrixDecisions,
+    MatrixMetadata,
+    MotionEligibility,
+    MotionEpochMetadata,
+    SamplingMode,
+    SamplingPolicy,
+    TargetPolicy,
+    TemplateSizeMode,
+    TemplateSizePolicy,
+    TemporalDistanceUnit,
+    WeightingBasis,
+    WeightingKernel,
+    WeightingPolicy,
+)
 from .grid_search import CorrectionGridSearch, CorrectionGridSearchResult
-from .volume import RemoveVolumeArtifactCorrection, VolumeArtifactCorrection
-from .weighted import (
+from .legacy_adapters import (
+    AASCorrection,
+    AveragedArtifactSubtraction,
     AvgArtWghtCorrespondingSliceCorrection,
     AvgArtWghtMoosmannCorrection,
     AvgArtWghtSliceTriggerCorrection,
     AvgArtWghtVolumeTriggerCorrection,
     CorrespondingSliceCorrection,
+    FARMArtifactCorrection,
+    FARMCorrection,
     MoosmannCorrection,
     SliceTriggerCorrection,
     VolumeTriggerCorrection,
 )
+from .presets import (
+    AAS_PER_TARGET,
+    CLI_CORRECTION_PRESETS,
+    CORRESPONDING_SLICE,
+    FARM_PER_TARGET_K10,
+    FLEX_DEFAULT,
+    LEGACY_RESEMBLANCE,
+    MOOSMANN_COST,
+    PRESET_BUILDERS,
+    STRUCTURAL_SLICE,
+    STRUCTURAL_VOLUME,
+    build_flex_preset,
+)
+from .volume import RemoveVolumeArtifactCorrection, VolumeArtifactCorrection
 
 __all__ = [
     # Shared template-matrix engine
     "Flex",
     "FlexCorrection",
-    # Legacy matrix strategies
+    "AveragingMatrixBuilder",
+    "CandidateScoringMode",
+    "CandidateScoringPolicy",
+    "DirectionalQuota",
+    "SamplingMode",
+    "SamplingPolicy",
+    "MotionEligibility",
+    "TargetPolicy",
+    "TemplateSizeMode",
+    "TemplateSizePolicy",
+    "CorrelationMode",
+    "CorrelationPolicy",
+    "WeightingBasis",
+    "TemporalDistanceUnit",
+    "WeightingKernel",
+    "WeightingPolicy",
+    "MatrixDecisions",
+    "MatrixMetadata",
+    "MotionEpochMetadata",
+    "MatrixDecisionError",
+    "MOTION_METADATA_KEY",
+    # Named Flex recipes
+    "FLEX_DEFAULT",
+    "AAS_PER_TARGET",
+    "FARM_PER_TARGET_K10",
+    "STRUCTURAL_VOLUME",
+    "STRUCTURAL_SLICE",
+    "CORRESPONDING_SLICE",
+    "MOOSMANN_COST",
+    "CLI_CORRECTION_PRESETS",
+    "LEGACY_RESEMBLANCE",
+    "PRESET_BUILDERS",
+    "build_flex_preset",
+    # Flex-backed compatibility names
     "AASCorrection",
     "AveragedArtifactSubtraction",
     "FARMCorrection",
@@ -39,7 +111,7 @@ __all__ = [
     # Volume transitions
     "VolumeArtifactCorrection",
     "RemoveVolumeArtifactCorrection",
-    # Legacy structural and motion-weighted strategies
+    # Structural and motion compatibility names
     "CorrespondingSliceCorrection",
     "VolumeTriggerCorrection",
     "SliceTriggerCorrection",

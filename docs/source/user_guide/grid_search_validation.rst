@@ -128,3 +128,63 @@ Other Visualizations
 
 Every visualization has a corresponding CSV containing the unnormalized
 values needed for statistical analysis.
+
+Composable Matrix Optimization
+------------------------------
+
+``examples/run_matrix_optimization.py`` searches the complete composable
+``MatrixDecisions`` graph instead of the four legacy ``Flex`` grid
+parameters. Install its optional dependency and run it on at least three
+recordings:
+
+.. code-block:: bash
+
+   uv sync --extra optimization
+   uv run python examples/run_matrix_optimization.py \
+       /path/to/eeg/files /path/to/results \
+       --recursive --trials 100 --promotion-count 20
+
+For each held-out recording, multi-objective TPE screens conditional recipes
+on a deterministic training subset. Legacy-inspired anchors and balanced
+categorical seed trials are evaluated before TPE concentrates its search.
+The screening Pareto recipes are then promoted to every training recording;
+only that full-training Pareto table is used to choose the recipe evaluated
+on the held-out recording.
+
+The objectives now minimize residual power at prominent scanner-on spectral
+peaks and minimize the mean absolute log-deviation of theta, alpha, and
+non-peak beta power. Peaks are detected from the matching uncorrected
+scanner-on EEG, restricted to 13--80 Hz by default, and evaluated in narrow
+frequency neighborhoods. Theta and alpha must remain within 0.8--1.25 of
+their uncorrected scanner-on power; non-peak beta defaults to 0.5--1.5.
+Therefore, broadband artifact removal cannot win by also suppressing
+physiological frequency regions. The original SNR, RMS residual, and median
+artifact metrics remain in reports as diagnostics but no longer determine
+Pareto dominance or feasibility.
+
+Peak detection and preservation bounds are configurable with
+``--scanner-peak-minimum-hz``, ``--scanner-peak-maximum-hz``,
+``--scanner-peak-prominence-db``, ``--scanner-peak-half-width-hz``,
+``--preservation-ratio-bound``, and the two ``--beta-preservation-*``
+options. If no promoted recipe is feasible, the reports preserve the fallback
+choice explicitly.
+
+The spectral change adds new raw evaluation metrics, so older caches and
+Optuna studies are incompatible. Use a new output directory, or pass both
+``--rebuild-cache`` and ``--rebuild-studies`` when intentionally replacing an
+older run.
+
+The run is resumable. Optuna studies live in
+``folds/<held-out>/screening_study.sqlite3`` and expensive dataset/recipe
+evaluations are atomically cached in ``evaluation_cache.csv``. Each fold
+writes its screening trials, promoted training results, training Pareto set,
+selected recipe manifest, and held-out metrics. The top-level reports include
+bootstrap confidence intervals and selected-parameter stability.
+
+Motion-dependent branches are enabled only when every training recording has
+a matching sidecar supplied through ``--motion-directory``. ``.npz``
+sidecars may contain ``parameters``, ``segment_ids``, ``stable``, and an
+explicit ``epoch_to_motion_index``. Plain ``.npy``, ``.txt``, or ``.tsv``
+files are interpreted as motion-parameter arrays. Volume-level rows are
+mapped automatically only when the detected number of slices per volume makes
+the mapping unambiguous; otherwise an explicit epoch mapping is required.

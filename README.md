@@ -272,7 +272,11 @@ facetpy-run process \
 
 The output directory is always a folder because chunked processing can create
 one or more corrected files per input. For batch runs, each source input gets
-its own subfolder unless `--flat-output` is used.
+its own subfolder unless `--flat-output` is used. Every recording also gets a
+dedicated `*_facetpy.log`, a self-describing `quality_metrics.json`, the
+pipeline and template-matrix JSON files, and a static HTML quality-control
+report. Recursive and list-based runs never mix log records from different
+EEGs.
 
 ### Patterns, correction modes, and add-on modes
 
@@ -280,8 +284,8 @@ Patterns define the whole pipeline shape:
 
 | Pattern | Use when |
 |---|---|
-| `--pattern quickstart` | You want the default memory-light scanner workflow; add `--mode bcg` for cardiac cleanup |
-| `--pattern standard` | You want the full docs-style scanner workflow with pattern-selected PCA and ANC; add `--mode bcg` for cardiac cleanup |
+| `--pattern standard` | **Default.** Full docs-style scanner workflow with pattern-selected PCA and ANC; add `--mode bcg` for cardiac cleanup |
+| `--pattern quickstart` | You explicitly want the smaller scanner workflow without the standard PCA and ANC stages |
 | `--pattern bcg` | You want the specialized BCG-only path |
 
 Correction modes choose the main template-subtraction strategy:
@@ -301,24 +305,20 @@ non-target candidate window, `--flex-threshold` selects correlated epochs,
 `--flex-min-accepted` supplements that selection when too few pass, and
 `--flex-distribution equal|normal` controls their averaging weights.
 
-All template-subtraction modes use the engine implemented by `Flex`, which
-inherits directly from `Processor`. For each channel, the engine extracts the
-epoch data matrix `D`, asks the selected strategy to construct its averaging
-matrix `A`, calculates the artifact templates as `N = A @ D`, and subtracts
-the corresponding row of `N` at each trigger. `AASCorrection`,
-`FARMCorrection`, `CorrespondingSliceCorrection`, `VolumeTriggerCorrection`,
-`SliceTriggerCorrection`, and `MoosmannCorrection` are direct `Flex`
-subclasses retained as compatibility strategies for their established matrix
-rules and constructor APIs.
+All CLI template-subtraction modes instantiate `Flex`; the selected name maps
+to a complete decision recipe for candidate quota, sampling, motion,
+target inclusion, scoring, template size, and weighting. For each channel,
+Flex extracts `D`, builds `A` from those decisions, computes `N = A @ D`, and
+subtracts the corresponding row of `N` at each trigger. The report records the
+whole recipe and the legacy algorithm it most closely resembles.
 
-The four Flex controls configure Flex's native future-first correlation
-strategy; they do not exactly reproduce every legacy matrix rule. The
-compatibility subclasses remain the explicit way to request those rules while
-the API evolves toward named Flex strategies or presets. `ANCCorrection`,
-`PCACorrection`, and `VolumeArtifactCorrection` remain independent processors:
-they perform adaptive filtering, PCA reconstruction, and volume-transition
-correction respectively, rather than building artifact templates with
-`N = A @ D`.
+The old hard-coded AAS, FARM, and weighted source snapshots live in
+`src/facet/correction/archived_algos` and are not imported by the CLI. Public
+legacy class names remain available as thin Flex-backed compatibility
+adapters. `ANCCorrection`, `PCACorrection`, and `VolumeArtifactCorrection`
+remain independent add-on processors because they use adaptive filtering,
+PCA reconstruction, and volume-transition correction rather than constructing
+`A`.
 
 Add-on modes are layered around the selected correction mode and can be passed
 more than once:
@@ -432,14 +432,38 @@ The older `--memory-budget-mb` spelling remains an alias for
 
 ### Process outputs and reports
 
-Each successful `process` output folder includes corrected chunk files and
-JSON metadata:
+Each successful `process` output folder includes corrected chunk files, a
+self-contained HTML quality-control report, and JSON metadata:
 
 | File | Contents |
 |---|---|
+| `<source>_cleaning_report.html` | Offline before/during/after report with temporal spectra, Welch PSD, amplitude distributions, embedded Flex matrices, graph-Laplacian energy, clean topomap GIF, coherence matrices/network, and the complete pipeline record |
 | `chunks_manifest.json` | Source path, chunk windows, output files, runtime, success/error per chunk |
-| `pipeline_description.json` | Pattern, correction mode, BCG mode status, add-on modes, processor list, parameters, output paths |
-| `artifact_template_matrices.json` | Flex-engine `N = A @ D` reports: epoch matrix `D`, averaging matrix `A`, and artifact-template matrix `N` preview |
+| `pipeline_description.json` | Pattern, correction mode, BCG mode status, add-on modes, processor list, parameters, HTML report path, and corrected output paths |
+| `artifact_template_matrices.json` | Flex-engine `N = A @ D` reports: epoch matrix `D`, averaging matrix `A`, artifact-template matrix `N` preview, and ordered diagnostic-plot records |
+
+The HTML file embeds every plot and animation as a data URI, so it can be
+opened or archived without a separate report-assets folder. Its comparisons
+use exact non-overlapping exported chunk cores, match EEG channels by name, and
+never treat overlap context as independent data. To keep reporting bounded for
+large studies, signal analytics use up to eight stratified chunks, up to three
+temporal strata per selected core, at most 120 seconds of paired data, a 1 kHz
+report-rate cap, and 16 million samples per phase; the report records every
+analyzed window and any report-rate change. The complete chunk manifest is
+also embedded, including core/overlap boundaries, chunking mode, and memory
+budget. In a multi-input `--flat-output` run, source-specific hashed HTML and
+JSON names prevent equal basenames from overwriting one another.
+
+Temporal frequency plots and graph frequency are intentionally separate:
+Welch PSD is shown in Hz and µV²/Hz, while the electrode-graph Laplacian panel
+uses graph eigenvalue λ and empirical graph-mode energy. Scalp maps prefer
+recorded electrode positions, then recognized MNE templates. If the channel
+names do not support defensible positions, spatial sections show an explicit
+unavailable notice instead of inventing a head layout. Coherence is presented
+as an 8–13 Hz alpha-band, rank-thresholded exploratory sensor-space summary
+because reference choice and volume conduction can affect it. The thresholded
+edges and communities are not statistical-significance or causal-connectivity
+claims.
 
 If a recording fails and `--on-error continue` is used, FACETpy writes
 `processing_error.json` in that recording's output folder and

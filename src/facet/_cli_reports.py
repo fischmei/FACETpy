@@ -46,13 +46,23 @@ def _write_batch_failures(output_root: Path, failures: list[dict[str, str]]) -> 
 
 def _processor_report(processor, index: int) -> dict:
     """Return a JSON-friendly processor description for process reports."""
-    return {
+    report = {
         "index": index,
         "name": processor.name,
         "type": processor.__class__.__name__,
         "description": getattr(processor, "description", ""),
         "parameters": _json_safe(getattr(processor, "_parameters", {})),
     }
+    decisions = getattr(processor, "matrix_decisions", None)
+    if decisions is not None:
+        report["flex_preset"] = getattr(processor, "flex_preset_name", "custom_flex")
+        report["legacy_algorithm_resemblance"] = getattr(
+            processor,
+            "legacy_algorithm_resemblance",
+            "custom Flex",
+        )
+        report["flex_decisions"] = _json_safe(decisions.to_dict())
+    return report
 
 
 def _chunk_report(chunk, result) -> dict:
@@ -62,6 +72,10 @@ def _chunk_report(chunk, result) -> dict:
         "total": int(chunk.total),
         "start_sample": int(chunk.start_sample),
         "stop_sample": int(chunk.stop_sample),
+        "core_start_sample": int(getattr(chunk, "resolved_core_start_sample", chunk.start_sample)),
+        "core_stop_sample": int(getattr(chunk, "resolved_core_stop_sample", chunk.stop_sample)),
+        "left_overlap_samples": int(getattr(chunk, "left_overlap_samples", 0)),
+        "right_overlap_samples": int(getattr(chunk, "right_overlap_samples", 0)),
         "duration_seconds": float(chunk.duration_seconds),
         "output_path": str(chunk.output_path),
         "success": bool(result.success),
@@ -105,10 +119,36 @@ def _collect_artifact_template_reports(chunked_result) -> list[dict]:
     return reports
 
 
-def _write_artifact_template_matrix_report(target_dir: Path, input_path: Path, chunked_result) -> Path:
+def _collect_artifact_template_plots(chunked_result) -> list[dict]:
+    """Collect ordered Flex diagnostic-plot records from chunk contexts."""
+    chunks = list(getattr(chunked_result, "chunks", []))
+    plots: list[dict] = []
+
+    for chunk, result in zip(chunks, _chunked_results(chunked_result), strict=False):
+        context = getattr(result, "context", None)
+        if context is None:
+            continue
+
+        custom = getattr(context.metadata, "custom", {})
+        for plot in custom.get("artifact_template_matrix_plots", []):
+            plot_payload = _json_safe(plot)
+            plot_payload.setdefault("chunk_index", int(chunk.index))
+            plot_payload.setdefault("chunk_total", int(chunk.total))
+            plots.append(plot_payload)
+
+    return plots
+
+
+def _write_artifact_template_matrix_report(
+    target_dir: Path,
+    input_path: Path,
+    chunked_result,
+    filename: str = "artifact_template_matrices.json",
+) -> Path:
     """Write the per-recording artifact template matrix report."""
     reports = _collect_artifact_template_reports(chunked_result)
-    report_path = target_dir / "artifact_template_matrices.json"
+    diagnostic_plots = _collect_artifact_template_plots(chunked_result)
+    report_path = target_dir / filename
     payload = {
         "source_path": str(input_path),
         "description": (
@@ -117,6 +157,7 @@ def _write_artifact_template_matrix_report(target_dir: Path, input_path: Path, c
         ),
         "report_count": len(reports),
         "reports": reports,
+        "diagnostic_plots": diagnostic_plots,
     }
     if not reports:
         payload["note"] = "No Flex template-matrix report was produced for this run."
@@ -132,12 +173,28 @@ def _write_pipeline_description(
     pipeline: Pipeline,
     chunked_result,
     matrix_report_path: Path,
+    html_report_path: Path | None = None,
+    log_path: Path | None = None,
+    quality_metrics_path: Path | None = None,
+    filename: str = "pipeline_description.json",
 ) -> Path:
     """Write a per-recording JSON description of the process pipeline."""
     chunks = list(getattr(chunked_result, "chunks", []))
     results = _chunked_results(chunked_result)
     add_on_modes, selected_by_pattern = _selected_add_on_modes(args)
     bcg_enabled = args.pattern == "bcg" or "bcg" in add_on_modes
+    processor_reports = [_processor_report(processor, index) for index, processor in enumerate(pipeline.processors, 1)]
+    flex_corrections = [
+        {
+            "processor_index": report["index"],
+            "processor_name": report["name"],
+            "preset": report["flex_preset"],
+            "legacy_algorithm_resemblance": report["legacy_algorithm_resemblance"],
+            "decisions": report["flex_decisions"],
+        }
+        for report in processor_reports
+        if "flex_decisions" in report
+    ]
     payload = {
         "source_path": str(input_path),
         "output_dir": str(target_dir),
@@ -146,6 +203,7 @@ def _write_pipeline_description(
         "correction_mode": args.correction_mode,
         "correction_mode_description": CORRECTION_MODE_DESCRIPTIONS.get(args.correction_mode),
         "correction_matrix_description": CORRECTION_MATRIX_DESCRIPTIONS.get(args.correction_mode),
+        "flex_corrections": flex_corrections,
         "bcg_enabled": bool(bcg_enabled),
         "bcg_selected_as_mode": "bcg" in add_on_modes,
         "bcg_window_size": int(args.bcg_window_size),
@@ -158,7 +216,7 @@ def _write_pipeline_description(
             for key, value in vars(args).items()
             if key not in {"func", "input", "input_list", "input_dir"}
         },
-        "processors": [_processor_report(processor, index) for index, processor in enumerate(pipeline.processors, 1)],
+        "processors": processor_reports,
         "result": {
             "success": bool(chunked_result.was_successful()),
             "execution_time_seconds": float(getattr(chunked_result, "execution_time", 0.0)),
@@ -168,11 +226,14 @@ def _write_pipeline_description(
                 else None
             ),
             "artifact_template_matrix_report": str(matrix_report_path),
+            "html_cleaning_report": str(html_report_path) if html_report_path is not None else None,
+            "log_file": str(log_path) if log_path is not None else None,
+            "quality_metrics_report": str(quality_metrics_path) if quality_metrics_path is not None else None,
             "chunks": [_chunk_report(chunk, result) for chunk, result in zip(chunks, results, strict=False)],
         },
     }
 
-    description_path = target_dir / "pipeline_description.json"
+    description_path = target_dir / filename
     description_path.write_text(json.dumps(_json_safe(payload), indent=2), encoding="utf-8")
     return description_path
 

@@ -89,6 +89,31 @@ def _resolve_log_directory() -> Path:
     return log_dir
 
 
+@contextlib.contextmanager
+def recording_log(path: str | Path) -> Generator[Path, None, None]:
+    """Capture one CLI recording's Loguru output in a dedicated file.
+
+    The sink uses the active console level so it contains the same log records
+    a classic terminal run receives.  It is synchronous and removed at the end
+    of the recording, which prevents recursive or batch runs from mixing EEGs.
+    """
+    log_path = Path(path).expanduser().resolve()
+    log_path.parent.mkdir(parents=True, exist_ok=True)
+    sink_id = logger.add(
+        log_path,
+        level=str(get_config("log_level")).upper(),
+        enqueue=False,
+        backtrace=True,
+        diagnose=False,
+        encoding="utf-8",
+        mode="w",
+    )
+    try:
+        yield log_path
+    finally:
+        logger.remove(sink_id)
+
+
 def configure_logging(force: bool = False) -> Path | None:
     """
     Configure global logging if it has not been configured yet.
@@ -186,4 +211,4 @@ def configure_logging(force: bool = False) -> Path | None:
     return log_file
 
 
-__all__ = ["configure_logging", "suppress_stdout"]
+__all__ = ["configure_logging", "recording_log", "suppress_stdout"]

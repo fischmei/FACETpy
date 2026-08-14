@@ -41,22 +41,6 @@ TEMPLATE_CORRECTION_CLASSES = (
 )
 
 
-def _scaled_epochs(n_epochs: int = 8) -> np.ndarray:
-    """Return non-constant epochs with identical positive correlation."""
-    base_epoch = np.array([-3.0, -1.0, 0.0, 2.0, 4.0])
-    return np.vstack([(epoch_idx + 1.0) * base_epoch for epoch_idx in range(n_epochs)])
-
-
-def _averaging_matrix(processor, epochs: np.ndarray) -> np.ndarray:
-    """Call the matrix-strategy hook through its shared engine contract."""
-    return processor._calc_averaging_matrix(
-        epochs=epochs,
-        window_size=processor.window_size,
-        rel_window_offset=processor.rel_window_position,
-        correlation_threshold=processor.correlation_threshold,
-    )
-
-
 class TestTemplateCorrectionHierarchy:
     """Lock the inheritance direction and public discovery contract."""
 
@@ -65,9 +49,9 @@ class TestTemplateCorrectionHierarchy:
         assert Flex.__bases__ == (Processor,)
 
     @pytest.mark.parametrize("correction_class", TEMPLATE_CORRECTION_CLASSES)
-    def test_template_variants_directly_inherit_flex(self, correction_class):
-        """Legacy matrix strategies should be removable independently of one another."""
-        assert Flex in correction_class.__bases__
+    def test_template_variants_use_flex_engine(self, correction_class):
+        """Compatibility names should all delegate to the shared Flex engine."""
+        assert issubclass(correction_class, Flex)
 
     @pytest.mark.parametrize(
         ("name", "correction_class"),
@@ -109,9 +93,8 @@ class TestTemplateCorrectionHierarchy:
             [
                 "import importlib",
                 "importlib.import_module('facet.correction.flex')",
-                "importlib.import_module('facet.correction.aas')",
-                "importlib.import_module('facet.correction.farm')",
-                "importlib.import_module('facet.correction.weighted')",
+                "importlib.import_module('facet.correction.presets')",
+                "importlib.import_module('facet.correction.legacy_adapters')",
             ]
         )
         environment = os.environ.copy()
@@ -216,120 +199,48 @@ class TestTemplateCorrectionReconstruction:
         assert reconstructed._parameters == processor._parameters
 
 
-class TestLegacyAveragingMatrices:
-    """Freeze the numerical matrix strategies while their engine moves to Flex."""
+class TestPresetBackedCompatibility:
+    """Verify that public legacy names now expose named Flex recipes."""
 
-    def test_shared_engine_rejects_nonfinite_data_before_legacy_strategy(self, sample_context):
-        """Legacy matrix overrides must not bypass Flex's finite-data guard."""
+    def test_shared_engine_rejects_nonfinite_data(self, sample_context):
+        """Compatibility adapters must retain Flex's finite-data guard."""
         sample_context.get_raw()._data[0, 0] = np.nan
         processor = AASCorrection(window_size=3, realign_after_averaging=False)
 
         with pytest.raises(ProcessorValidationError, match="requires finite epoch data"):
             processor.execute(sample_context)
 
-    def test_aas_matrix_is_unchanged(self):
-        """AAS should retain its block-seeded running-average weights."""
-        processor = AASCorrection(
-            window_size=3,
-            correlation_threshold=0.99,
-            realign_after_averaging=False,
-        )
-        matrix = _averaging_matrix(processor, _scaled_epochs())
+    @pytest.mark.parametrize(
+        ("processor", "preset"),
+        [
+            (AASCorrection(), "aas_per_target"),
+            (FARMCorrection(), "farm_per_target_k10"),
+            (CorrespondingSliceCorrection(slices_per_volume=2), "corresponding_slice"),
+            (VolumeTriggerCorrection(), "structural_volume"),
+            (SliceTriggerCorrection(), "structural_slice"),
+        ],
+    )
+    def test_legacy_names_expose_flex_decision_manifest(self, processor, preset):
+        """Every compatibility adapter should carry reportable recipe provenance."""
+        assert processor.flex_preset_name == preset
+        assert processor.legacy_algorithm_resemblance
+        assert processor.matrix_decisions is not None
+        assert set(processor.matrix_decisions.to_dict()) == {
+            "motion",
+            "quota",
+            "sampling",
+            "scoring",
+            "target_policy",
+            "template_size",
+            "weighting",
+        }
 
-        expected = np.zeros((8, 8), dtype=float)
-        expected[0:3, 0:5] = 1.0 / 5.0
-        expected[3:6, 3:8] = 1.0 / 5.0
-        expected[6:8, 6:8] = 1.0 / 2.0
-
-        np.testing.assert_allclose(matrix, expected)
-
-    def test_farm_matrix_is_unchanged(self):
-        """FARM should retain absolute-correlation ranking within its search window."""
-        epochs = np.random.RandomState(47).normal(size=(8, 11))
-        processor = FARMCorrection(
-            window_size=3,
-            correlation_threshold=0.1,
-            search_half_window=3,
-            realign_after_averaging=False,
-        )
-        matrix = _averaging_matrix(processor, epochs)
-
-        selected_by_row = (
-            (1, 4, 6),
-            (3, 5, 6),
-            (4, 5, 6),
-            (1, 5, 6),
-            (1, 3, 5),
-            (1, 3, 6),
-            (1, 2, 3),
-            (2, 3, 6),
-        )
-        expected = np.zeros((8, 8), dtype=float)
-        for row, selected in enumerate(selected_by_row):
-            expected[row, selected] = 1.0 / 3.0
-
-        np.testing.assert_allclose(matrix, expected)
-
-    def test_corresponding_slice_matrix_is_unchanged(self):
-        """Corresponding-slice templates should retain slice-position parity."""
-        processor = CorrespondingSliceCorrection(
-            slices_per_volume=2,
-            window_size=2,
-            realign_after_averaging=False,
-        )
-        # The execution path resolves this value from processor configuration
-        # or context metadata immediately before asking the shared engine for A.
-        processor._runtime_slices_per_volume = 2
-        matrix = _averaging_matrix(processor, _scaled_epochs())
-
-        expected = np.zeros((8, 8), dtype=float)
-        for row in range(8):
-            expected[row, row % 2 :: 2] = 1.0 / 4.0
-
-        np.testing.assert_allclose(matrix, expected)
-
-    def test_volume_trigger_matrix_is_unchanged(self):
-        """Volume-trigger correction should retain its fixed border window."""
-        processor = VolumeTriggerCorrection(
-            window_size=4,
-            realign_after_averaging=False,
-        )
-        matrix = _averaging_matrix(processor, _scaled_epochs())
-
-        expected = np.zeros((8, 8), dtype=float)
-        expected[:, 1:6] = 1.0 / 5.0
-
-        np.testing.assert_allclose(matrix, expected)
-
-    def test_slice_trigger_matrix_is_unchanged(self):
-        """Slice-trigger correction should retain alternating epoch sets."""
-        processor = SliceTriggerCorrection(
-            window_size=2,
-            realign_after_averaging=False,
-        )
-        matrix = _averaging_matrix(processor, _scaled_epochs())
-
-        expected = np.zeros((8, 8), dtype=float)
-        expected[0, [1, 3, 5]] = 1.0 / 3.0
-        expected[1:, [2, 4, 6]] = 1.0 / 3.0
-
-        np.testing.assert_allclose(matrix, expected)
-
-    def test_moosmann_matrix_is_unchanged_without_motion(self, tmp_path):
-        """Moosmann should retain its normalized centered moving window."""
+    def test_moosmann_name_exposes_motion_flex_recipe(self, tmp_path):
+        """Moosmann compatibility should resolve to the motion-aware recipe."""
         rp_file = tmp_path / "rp_no_motion.txt"
-        rp_file.write_text("0 0 0 0 0 0\n" * 8, encoding="utf-8")
-        processor = MoosmannCorrection(
-            rp_file=str(rp_file),
-            window_size=2,
-            realign_after_averaging=False,
-        )
-        matrix = _averaging_matrix(processor, _scaled_epochs())
+        rp_file.write_text("0 0 0 0 0 0\n", encoding="utf-8")
+        processor = MoosmannCorrection(rp_file=str(rp_file))
 
-        expected = np.zeros((8, 8), dtype=float)
-        for row in range(8):
-            start = max(0, row - 2)
-            stop = min(8, row + 3)
-            expected[row, start:stop] = 1.0 / (stop - start)
-
-        np.testing.assert_allclose(matrix, expected)
+        assert processor.flex_preset_name == "moosmann_cost"
+        assert processor.matrix_decisions.quota.global_mode is True
+        assert processor.matrix_decisions.motion.motion_stable_only is True

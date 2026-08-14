@@ -392,14 +392,12 @@ subtracts row ``n`` of ``N`` from target epoch ``n``. Trigger realignment,
 optional template scaling and gap interpolation, estimated-noise accumulation,
 and matrix reporting are also shared by this engine.
 
-The existing named template corrections are direct ``Flex`` subclasses kept
-for compatibility. ``AASCorrection`` retains its block running-average rule,
-``FARMCorrection`` retains its absolute-correlation ranking,
-``CorrespondingSliceCorrection`` and ``VolumeTriggerCorrection`` retain their
-volume-aware index rules, ``SliceTriggerCorrection`` retains its odd/even
-selection, and ``MoosmannCorrection`` retains its motion-informed weights.
-They share the surrounding correction engine, but each still constructs a
-different ``A``.
+The existing named template-correction imports are Flex-backed compatibility
+adapters. Each selects a complete named recipe for candidate quota, sampling,
+motion eligibility, target inclusion, scoring, template size, and weighting;
+it does not execute a separate hard-coded matrix implementation. The archived
+implementations remain available for source-level comparison under
+``src/facet/correction/archived_algos``.
 
 ``ANCCorrection``, ``PCACorrection``, and ``VolumeArtifactCorrection`` remain
 independent processors because they do not construct templates as ``A @ D``.
@@ -408,7 +406,7 @@ reconstruct PCA residuals, and blend artifacts around volume transitions.
 
 **AASCorrection** - Averaged Artifact Subtraction
 
-The compatibility strategy for the established AAS averaging matrix:
+The compatibility name for the closest per-target AAS-like Flex recipe:
 
 .. code-block:: python
 
@@ -436,7 +434,8 @@ For example, with eight epochs numbered 0 through 7 and ``window_size=4``:
 - target 6 uses ``[3, 4, 5, 7]`` (one future epoch and three backfilled epochs);
 - target 7 uses ``[3, 4, 5, 6]`` (four backfilled epochs).
 
-Candidates with a signed Pearson correlation greater than or equal to
+Without an explicit ``matrix_decisions`` recipe, candidates with a signed
+Pearson correlation greater than or equal to
 ``threshold`` are accepted. All candidates that pass remain selected, even
 when their number exceeds ``min_accepted``. If too few pass, the remaining
 candidates are added from highest to lowest signed correlation until
@@ -451,14 +450,12 @@ and one third of the effective candidate-window size. The weights are then
 normalized to sum to one. Thus, ``"normal"`` favors selected epochs closer in
 time; it does not favor past epochs over future epochs.
 
-Together, these parameters describe a continuum within Flex's native
-future-first strategy rather than a collection of named presets. A high
+Together, these four compatibility parameters describe a continuum within
+Flex's native future-first strategy. A high
 threshold with a small ``min_accepted`` produces a selective template, while
 setting ``min_accepted=window_size`` forces every available candidate into the
 template. Intermediate threshold, minimum-count, window, and weighting choices
-span the behavior between those endpoints. They do not exactly recreate the
-legacy AAS, FARM, slice/volume, or motion-informed matrices; use the named
-compatibility subclass when one of those specific rules is required.
+span the behavior between those endpoints.
 
 .. code-block:: python
 
@@ -471,6 +468,52 @@ compatibility subclass when one of those specific rules is required.
        N_distribution="normal", # Give temporally closer selections more weight.
    )
    context = flex.execute(context)
+
+To open the full component space, pass a typed ``MatrixDecisions`` recipe. The
+finite directional quota ``(P, F)`` is counted after the sampling and motion
+eligibility rules. For example, ``(0, 10)`` with alternating sampling requests
+ten future candidates at offsets ``+1, +3, ..., +19``. Boundary completion
+fills an unavailable directional quota from the opposite side; global mode
+instead returns every eligible sampled epoch and ignores ``window_size``.
+
+.. code-block:: python
+
+   from facet.correction import (
+       CandidateScoringPolicy,
+       DirectionalQuota,
+       Flex,
+       MatrixDecisions,
+       SamplingPolicy,
+       TargetPolicy,
+       TemplateSizePolicy,
+       WeightingPolicy,
+   )
+
+   decisions = MatrixDecisions(
+       quota=DirectionalQuota.future_heavy(10),  # (past, future) = (3, 7)
+       sampling=SamplingPolicy.alternating(),
+       target_policy=TargetPolicy.EXCLUDE,
+       scoring=CandidateScoringPolicy.absolute_pearson(threshold=0.975),
+       template_size=TemplateSizePolicy.exactly(k=5),
+       weighting=WeightingPolicy.laplace(scale=3.0),
+   )
+   context = Flex(matrix_decisions=decisions).execute(context)
+
+The other quota constructors are ``past_only``, ``future_only``,
+``symmetric``, ``past_heavy``, ``future_heavy``, ``custom``, and
+``global_pool``. Sampling is ``consecutive``, ``alternating``, or
+``same_slice_phase``. Scoring is signed Pearson, absolute Pearson, temporal
+plus cumulative-motion cost, or none. Pearson scoring supports ``minimum_k``,
+``maximum_k``, and ``exactly_k``. Cost scoring supports ``maximum_k`` and
+``exactly_k``; none requires ``select_all``. Higher correlations and lower
+costs are preferred, with temporal distance and candidate index resolving
+ties. Non-finite candidates cannot be used to fill ``k``.
+
+Selection only decides which epochs contribute. The later weighting policy is
+independent: Gaussian, Laplace, and Student-t kernels can use temporal or
+motion distance, while equal weighting ignores distance completely. Selection
+scores are not reused as weights. Each non-empty matrix row is normalized to
+one, while a row with no valid selected candidate remains zero.
 
 **ANCCorrection** - Adaptive Noise Cancellation
 

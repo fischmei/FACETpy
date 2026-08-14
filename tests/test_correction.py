@@ -102,6 +102,24 @@ class TestAASCorrection:
         generated_plot = output_path.with_suffix(".aas_matrices.png")
         assert generated_plot.exists()
 
+    def test_multiple_flex_stages_preserve_each_matrix_plot(self, sample_context, tmp_path):
+        """Sequential Flex stages must not overwrite their diagnostic figures."""
+        output_path = tmp_path / "chunk_output.edf"
+        metadata = sample_context.metadata.copy()
+        metadata.custom["chunk"] = {"output_path": str(output_path)}
+        context = sample_context.with_metadata(metadata)
+
+        first = AASCorrection(window_size=5).execute(context)
+        second = AASCorrection(window_size=5).execute(first)
+
+        first_plot = output_path.with_suffix(".aas_matrices.png")
+        second_plot = first_plot.with_name(f"{first_plot.stem}_02{first_plot.suffix}")
+        assert first_plot.exists()
+        assert second_plot.exists()
+        records = second.metadata.custom["artifact_template_matrix_plots"]
+        assert [record["stage"] for record in records] == [1, 2]
+        assert [record["path"] for record in records] == [str(first_plot), str(second_plot)]
+
     def test_aas_reduces_artifact_amplitude(self, sample_raw_with_artifacts, sample_triggers):
         """Test that AAS actually reduces artifact amplitude."""
         from facet.core import ProcessingMetadata
@@ -369,9 +387,10 @@ class TestFARMCorrection:
     """Tests for FARMCorrection processor."""
 
     def test_farm_initialization(self):
-        """Test FARM processor initialization."""
+        """FARM compatibility should expose its active Flex candidate pool."""
         farm = FARMCorrection(window_size=20, correlation_threshold=0.9, search_half_window=60)
-        assert farm.window_size == 20
+        assert farm.window_size == 120
+        assert farm.matrix_decisions.quota.window_size == 120
         assert farm.correlation_threshold == 0.9
         assert farm.search_half_window == 60
         assert farm.apply_epoch_alpha_scaling is False
@@ -380,7 +399,11 @@ class TestFARMCorrection:
         """Test FARM execution."""
         original_data = sample_context.get_raw()._data.copy()
 
-        farm = FARMCorrection(window_size=5, realign_after_averaging=False)
+        farm = FARMCorrection(
+            window_size=5,
+            correlation_threshold=0.0,
+            realign_after_averaging=False,
+        )
         result = farm.execute(sample_context)
 
         corrected_data = result.get_raw()._data
@@ -388,8 +411,8 @@ class TestFARMCorrection:
         assert not np.array_equal(original_data, corrected_data)
         assert result.has_estimated_noise()
 
-    def test_farm_matrix_rows_are_nonzero(self):
-        """FARM should keep valid averaging rows even for low-correlation epochs."""
+    def test_farm_matrix_can_leave_rows_empty_below_threshold(self):
+        """The maximum-k FARM recipe should not supplement rejected candidates."""
         rng = np.random.RandomState(0)
         epochs = rng.randn(12, 50)
         farm = FARMCorrection(window_size=4, correlation_threshold=0.9999, search_half_window=6)
@@ -399,14 +422,13 @@ class TestFARMCorrection:
             rel_window_offset=0.0,
             correlation_threshold=0.9999,
         )
-        row_sums = matrix.sum(axis=1)
-        np.testing.assert_allclose(row_sums, np.ones_like(row_sums), atol=1e-12)
+        np.testing.assert_array_equal(matrix, np.zeros_like(matrix))
 
     def test_farm_search_half_window_does_not_scale_with_window_size(self):
-        """FARM should not expand the candidate search span via a window-size multiplier."""
+        """Without an override, FARM should use the requested total candidate quota."""
         farm = FARMCorrection(window_size=5, search_half_window=None, search_half_window_factor=9.0)
 
-        assert farm._resolve_search_half_window(5) == 5
+        assert farm.matrix_decisions.quota.window_size == 5
 
 
 @pytest.mark.unit
@@ -559,8 +581,8 @@ class TestAASWeightingVariants:
         first_row = np.flatnonzero(matrix[0])
         second_row = np.flatnonzero(matrix[1])
 
-        assert np.array_equal(first_row, np.array([1, 3, 5]))
-        assert np.array_equal(second_row, np.array([2, 4, 6]))
+        assert np.array_equal(first_row, np.array([1, 3]))
+        assert np.array_equal(second_row, np.array([2, 4]))
         np.testing.assert_allclose(matrix.sum(axis=1), 1.0)
 
     def test_moosmann_correction_execution(self, sample_context, temp_dir):

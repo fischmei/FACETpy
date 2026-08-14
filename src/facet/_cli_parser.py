@@ -73,11 +73,16 @@ def _build_parser(
     process.add_argument(
         "--upsample-factor", type=int, default=10, help="Upsampling factor before template correction."
     )
-    process.add_argument("--window-size", type=int, default=30, help="Window size for template correction.")
+    process.add_argument(
+        "--window-size",
+        type=int,
+        default=None,
+        help="Override the selected Flex preset's candidate window (preset defaults: 10, FARM: 30).",
+    )
     process.add_argument(
         "--pattern",
         choices=tuple(PROCESS_PATTERN_DESCRIPTIONS),
-        default="quickstart",
+        default="standard",
         help="Whole-pipeline pattern. Use the 'patterns' command to list details.",
     )
     process.add_argument(
@@ -133,7 +138,13 @@ def _build_parser(
         "--farm-search-half-window-factor",
         type=float,
         default=3.0,
-        help="FARM search half-window multiplier when no explicit half-window is set.",
+        help="Deprecated compatibility option; named Flex presets use an explicit candidate quota.",
+    )
+    process.add_argument(
+        "--farm-template-size",
+        type=int,
+        default=10,
+        help="Maximum number of selected epochs for the FARM-like Flex preset.",
     )
     process.add_argument(
         "--flex-threshold",
@@ -174,7 +185,10 @@ def _build_parser(
         "--motion-window-size",
         type=int,
         default=None,
-        help="Motion weighting window size for --correction-mode=moosmann.",
+        help=(
+            "Template count for --correction-mode=moosmann. "
+            "Defaults to twice --window-size, or 60 when neither is supplied."
+        ),
     )
     process.add_argument(
         "--plot-artifacts",

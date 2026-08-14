@@ -3,58 +3,62 @@
 import numpy as np
 import pytest
 
-from facet.correction import CORRELATION_THRESHOLD_GRID, CorrectionGridSearch, FARMCorrection
+from facet.correction import CorrectionGridSearch, Flex
 
 
 @pytest.mark.unit
 class TestCorrectionGridSearch:
-    """Tests for lazy AAS/FARM grid-search construction."""
+    """Tests for Flex-only grid-search construction."""
 
-    def test_default_threshold_grid_uses_one_percent_steps(self, temp_dir):
-        """Correlation thresholds should cover 0.01 through 1.00."""
+    def test_default_threshold_grid_is_a_bounded_starter_set(self, temp_dir):
+        """Default thresholds should remain a moderate, reproducible set."""
         search = CorrectionGridSearch(
             output_csv=temp_dir / "grid.csv",
-            rel_window_positions=[0.0],
-            search_window_factors=[1.0],
             window_sizes=[5],
-            models=["aas"],
+            min_accepted_values=[3],
+            N_distributions=["equal"],
+            realign_after_averaging_values=[False],
+            search_window_factors=[1.0],
+            interpolate_volume_gaps_values=[False],
+            apply_epoch_alpha_scaling_values=[False],
         )
 
-        assert CORRELATION_THRESHOLD_GRID[0] == pytest.approx(0.01)
-        assert CORRELATION_THRESHOLD_GRID[-1] == pytest.approx(1.0)
-        assert len(CORRELATION_THRESHOLD_GRID) == 100
-        assert search.n_combinations == 100
+        assert search.thresholds == pytest.approx((0.50, 0.75, 0.90, 0.95))
+        assert search.n_combinations == 4
 
-    def test_parameter_grid_uses_same_parameters_for_aas_and_farm(self, temp_dir):
-        """AAS and FARM should receive the same grid rows and editable columns."""
+    def test_parameter_grid_combines_only_flex_parameters(self, temp_dir):
+        """The grid should contain complete, valid Flex constructor rows."""
         search = CorrectionGridSearch(
             output_csv=temp_dir / "grid.csv",
-            correlation_thresholds=[0.1],
-            rel_window_positions=[-1.0, 0.0, 1.0],
-            search_window_factors=[2.0],
+            thresholds=[0.1],
             window_sizes=[5],
-            models=["aas", "farm"],
+            min_accepted_values=[2, 4],
+            N_distributions=["equal", "normal"],
+            realign_after_averaging_values=[False],
+            search_window_factors=[2.0],
+            interpolate_volume_gaps_values=[False],
+            apply_epoch_alpha_scaling_values=[False],
         )
 
         params = search.iter_parameter_grid()
-        aas_rows = [row for row in params if row["model"] == "aas"]
-        farm_rows = [row for row in params if row["model"] == "farm"]
 
-        assert len(aas_rows) == 3
-        assert len(farm_rows) == 3
-        assert {row["rel_window_position"] for row in aas_rows} == {-1.0, 0.0, 1.0}
-        assert {row["rel_window_position"] for row in farm_rows} == {-1.0, 0.0, 1.0}
-        assert set(aas_rows[0]) == set(farm_rows[0])
+        assert len(params) == 4
+        assert {row["min_accepted"] for row in params} == {2, 4}
+        assert {row["N_distribution"] for row in params} == {"equal", "normal"}
+        assert all("model" not in row for row in params)
 
     def test_build_pipeline_uses_requested_correction_order(self, temp_dir):
         """Each generated pipeline should start trigger, upsample, model, downsample."""
         search = CorrectionGridSearch(
             output_csv=temp_dir / "grid.csv",
-            correlation_thresholds=[0.2],
-            rel_window_positions=[0.5],
+            thresholds=[0.2],
+            min_accepted_values=[3],
+            N_distributions=["equal"],
+            realign_after_averaging_values=[False],
             search_window_factors=[3.0],
             window_sizes=[7],
-            models=["aas"],
+            interpolate_volume_gaps_values=[False],
+            apply_epoch_alpha_scaling_values=[False],
         )
 
         [params] = search.iter_parameter_grid()
@@ -63,32 +67,36 @@ class TestCorrectionGridSearch:
         assert [processor.name for processor in pipeline.processors[:4]] == [
             "trigger_detector",
             "upsample",
-            "aas_correction",
+            "flex_correction",
             "downsample",
         ]
         assert pipeline.processors[2].window_size == 7
-        assert pipeline.processors[2].rel_window_position == pytest.approx(0.5)
+        assert pipeline.processors[2].threshold == pytest.approx(0.2)
         assert pipeline.processors[2].search_window_factor == pytest.approx(3.0)
 
-    def test_farm_receives_same_shared_parameters_as_aas(self, temp_dir):
-        """FARM should be built from the same shared grid parameter names."""
+    def test_pipeline_correction_is_flex(self, temp_dir):
+        """Grid search must not instantiate one of the archived algorithms."""
         search = CorrectionGridSearch(
             output_csv=temp_dir / "grid.csv",
-            correlation_thresholds=[0.2],
-            rel_window_positions=[0.25],
+            thresholds=[0.2],
+            min_accepted_values=[4],
+            N_distributions=["normal"],
+            realign_after_averaging_values=[True],
             search_window_factors=[4.0],
             window_sizes=[8],
-            models=["farm"],
+            interpolate_volume_gaps_values=[True],
+            apply_epoch_alpha_scaling_values=[True],
         )
 
         [params] = search.iter_parameter_grid()
         pipeline = search.build_pipeline(params)
         model = pipeline.processors[2]
 
-        assert isinstance(model, FARMCorrection)
+        assert type(model) is Flex
         assert model.window_size == 8
-        assert model.correlation_threshold == pytest.approx(0.2)
-        assert model.rel_window_position == pytest.approx(0.25)
+        assert model.threshold == pytest.approx(0.2)
+        assert model.min_accepted == 4
+        assert model.N_distribution == "normal"
         assert model.search_window_factor == pytest.approx(4.0)
 
     def test_auto_score_is_finite_for_scalar_metrics(self, temp_dir):

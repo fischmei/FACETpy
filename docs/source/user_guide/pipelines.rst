@@ -106,6 +106,47 @@ The ``PipelineResult`` object contains:
    else:
        print(f"Error: {result.error}")
 
+CLI Cleaning Reports
+--------------------
+
+Every successful ``facetpy-run process`` recording produces a self-contained
+``<source>_cleaning_report.html`` file alongside the corrected chunks and JSON
+provenance. The report is organized as a before/during/after narrative:
+
+- before and after one-sided amplitude spectra on the same Hz and amplitude
+  axes;
+- before and after Welch power spectral density on the same Hz grid;
+- matched amplitude histograms and two-second peak-to-peak box plots;
+- every Flex-derived ``D -> A -> N`` matrix diagnostic in execution order;
+- a sensor-coordinate electrode-graph Laplacian eigendecomposition and empirical graph
+  spectral energy (graph eigenvalue, not Hz);
+- an accelerated, fixed-scale clean-EEG scalp-voltage GIF when defensible
+  electrode coordinates are available;
+- before, after, and difference 8--13 Hz alpha-band coherence matrices plus a
+  clean-data spectral-modularity node-link network; and
+- the complete processor timeline, parameters, CLI options, chunk windows,
+  output paths, runtime, and retained JSON records.
+
+All images and the GIF are embedded in the HTML, so no report asset folder is
+required. Reporting reloads exact exported chunk cores after processing rather
+than retaining every chunk's large signal arrays. It matches source and clean
+channels by name and uses at most eight stratified chunks / 120 seconds of
+paired samples, up to three temporal strata per selected core, a 1 kHz report
+rate, and 16 million values per phase. The chosen windows, report-rate changes,
+and any skipped analysis are disclosed in the report. The complete chunk
+manifest is embedded with core/overlap ranges, chunking mode, and memory
+budget. Multi-input ``--flat-output`` runs use source-specific hashed HTML and
+JSON names so equal basenames do not collide.
+
+Topographic plots use recorded electrode positions first and recognized MNE
+templates only when names match. FACETpy does not invent spatial positions for
+generic channel labels. Likewise, sensor-space coherence is an exploratory
+coupling estimate that can be affected by the EEG reference and volume
+conduction. Its exact-density rank threshold is for visualization and is not a
+surrogate/FDR significance test; the report does not present it as causal
+connectivity, cortical source localization, or a standalone clinical
+diagnosis.
+
 Advanced Pipeline Features
 --------------------------
 

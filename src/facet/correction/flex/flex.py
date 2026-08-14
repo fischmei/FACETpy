@@ -3,21 +3,34 @@
 from __future__ import annotations
 
 import random
-from collections.abc import Iterator
+from collections.abc import Iterator, Mapping
 from numbers import Integral
 from pathlib import Path
-from typing import Literal
+from typing import Any, Literal
 
 import mne
 import numpy as np
 from loguru import logger
 from matplotlib import pyplot as plt
 
-from ..console import processor_progress
-from ..core import ProcessingContext, Processor, ProcessorValidationError, register_processor
-from ..helpers.crosscorr import crosscorrelation
-from ..helpers.utils import split_vector
-from ..misc.plot_aas_matricies import plot_aas_matrices
+from ...console import processor_progress
+from ...core import ProcessingContext, Processor, ProcessorValidationError, register_processor
+from ...helpers.crosscorr import crosscorrelation
+from ...helpers.utils import split_vector
+from ...misc.plot_aas_matricies import plot_aas_matrices
+from .decisions import (
+    AveragingMatrixBuilder,
+    CandidateScoringMode,
+    CorrelationMode,
+    CorrelationPolicy,
+    MatrixDecisionError,
+    MatrixDecisions,
+    MatrixMetadata,
+    TemplateSizeMode,
+    future_first_candidate_indices,
+    pearson_scores,
+    select_by_correlation,
+)
 
 DistributionName = Literal["equal", "normal"]
 
@@ -32,16 +45,19 @@ ARTIFACT_TEMPLATE_PREVIEW_COLUMNS = 12
 class Flex(Processor):
     """Remove trigger-locked artifacts with configurable epoch averaging.
 
-    Flex builds one artifact template for every target epoch. It searches the
-    following ``window_size`` epochs first and, near the end of a recording,
-    backfills the candidate window with the nearest preceding epochs. The
-    target epoch is never allowed to contribute to its own template.
+    Flex builds one artifact template for every target epoch. Without an
+    explicit ``matrix_decisions`` recipe, it searches the following
+    ``window_size`` epochs first and, near the end of a recording, backfills
+    the candidate window with the nearest preceding epochs. The target epoch
+    is excluded from this compatibility rule.
 
-    Every candidate whose signed Pearson correlation meets ``threshold`` is
-    accepted. If this produces fewer than ``min_accepted`` epochs, the
-    strongest remaining correlations are added even though they are below the
-    threshold. Selected epochs are then averaged either equally or with a
-    Gaussian kernel that favors epochs temporally closer to the target.
+    In the compatibility rule, every candidate whose signed Pearson
+    correlation meets ``threshold`` is accepted. If this produces fewer than
+    ``min_accepted`` epochs, the strongest valid remaining correlations are
+    added even though they are below the threshold. Selected epochs are then
+    averaged either equally or with a Gaussian kernel that favors epochs
+    temporally closer to the target. ``matrix_decisions`` opens these stages
+    as independent, typed policies without changing the surrounding lifecycle.
 
     Flex owns the common template-correction lifecycle used by every
     ``N = A @ D`` correction in FACETpy. For each channel it extracts an epoch
@@ -55,7 +71,7 @@ class Flex(Processor):
     ----------
     window_size : int
         Maximum number of non-target epochs considered for each target
-        (default: 30).
+        (default: 10).
     threshold : float
         Minimum signed Pearson correlation required for automatic acceptance,
         in the interval ``(0, 1]`` (default: 0.975).
@@ -88,6 +104,11 @@ class Flex(Processor):
         estimate for later ANC or inspection. Set to ``False`` when the
         corrected signal and metrics are the only outputs required
         (default: ``True``).
+    matrix_decisions : MatrixDecisions or mapping, optional
+        Complete composable recipe for constructing ``A``. When supplied, it
+        replaces only Flex's native future-first matrix rule; extraction,
+        ``N = A @ D``, realignment, alpha scaling, subtraction, noise tracking,
+        and reporting remain unchanged.
     """
 
     name = "flex_correction"
@@ -107,7 +128,7 @@ class Flex(Processor):
 
     def __init__(
         self,
-        window_size: int = 30,
+        window_size: int = 10,
         threshold: float = 0.975,
         min_accepted: int = 5,
         N_distribution: DistributionName = "equal",
@@ -117,7 +138,14 @@ class Flex(Processor):
         interpolate_volume_gaps: bool = False,
         apply_epoch_alpha_scaling: bool = False,
         track_estimated_noise: bool = True,
+        *,
+        matrix_decisions: MatrixDecisions | Mapping[str, Any] | None = None,
     ) -> None:
+        if isinstance(matrix_decisions, Mapping):
+            matrix_decisions = MatrixDecisions.from_dict(matrix_decisions)
+        if matrix_decisions is not None and not isinstance(matrix_decisions, MatrixDecisions):
+            raise MatrixDecisionError("matrix_decisions must be MatrixDecisions or a serialized mapping")
+
         self.threshold = threshold
         self.min_accepted = min_accepted
         # Compatibility aliases are intentionally excluded from Flex's
@@ -138,11 +166,28 @@ class Flex(Processor):
         self.interpolate_volume_gaps = interpolate_volume_gaps
         self.apply_epoch_alpha_scaling = apply_epoch_alpha_scaling
         self.track_estimated_noise = track_estimated_noise
+        self.matrix_decisions = matrix_decisions
+        if matrix_decisions is not None:
+            # Keep the established compatibility fields aligned with their
+            # active composable decisions. The full recipe remains the
+            # authoritative record for kernels and metadata-dependent axes.
+            if not matrix_decisions.quota.global_mode:
+                self.window_size = int(matrix_decisions.quota.window_size)
+            if matrix_decisions.scoring.mode in {
+                CandidateScoringMode.SIGNED_PEARSON,
+                CandidateScoringMode.ABSOLUTE_PEARSON,
+            }:
+                self.threshold = float(matrix_decisions.scoring.threshold)
+                self.correlation_threshold = self.threshold
+            if matrix_decisions.template_size.mode is not TemplateSizeMode.SELECT_ALL:
+                self.min_accepted = int(matrix_decisions.template_size.k)
+        self._runtime_matrix_metadata: MatrixMetadata | None = None
+        self._last_matrix_decision_manifest: dict[str, Any] | None = None
         super().__init__()
 
     def _get_parameters(self) -> dict[str, object]:
         """Return constructor-compatible parameters for history and workers."""
-        return {
+        parameters = {
             "window_size": self.window_size,
             "threshold": self.threshold,
             "min_accepted": self.min_accepted,
@@ -154,6 +199,9 @@ class Flex(Processor):
             "apply_epoch_alpha_scaling": self.apply_epoch_alpha_scaling,
             "track_estimated_noise": self.track_estimated_noise,
         }
+        if self.matrix_decisions is not None:
+            parameters["matrix_decisions"] = self.matrix_decisions.to_dict()
+        return parameters
 
     def validate(self, context: ProcessingContext) -> None:
         super().validate(context)
@@ -163,10 +211,12 @@ class Flex(Processor):
 
     def _validate_common_template_configuration(self, context: ProcessingContext) -> None:
         """Validate requirements shared by every template-matrix strategy."""
-        if isinstance(self.window_size, bool) or not isinstance(self.window_size, Integral):
-            raise ProcessorValidationError(f"window_size must be an integer, got {self.window_size!r}")
-        if self.window_size < 1:
-            raise ProcessorValidationError(f"window_size must be >= 1, got {self.window_size}")
+        finite_quota_active = self.matrix_decisions is None or not self.matrix_decisions.quota.global_mode
+        if finite_quota_active:
+            if isinstance(self.window_size, bool) or not isinstance(self.window_size, Integral):
+                raise ProcessorValidationError(f"window_size must be an integer, got {self.window_size!r}")
+            if self.window_size < 1:
+                raise ProcessorValidationError(f"window_size must be >= 1, got {self.window_size}")
         if self.search_window_factor <= 0:
             raise ProcessorValidationError(f"search_window_factor must be positive, got {self.search_window_factor}")
         if not isinstance(self.track_estimated_noise, bool):
@@ -177,7 +227,7 @@ class Flex(Processor):
             raise ProcessorValidationError("Artifact length not set. Run TriggerDetector first.")
 
         n_triggers = len(context.get_triggers())
-        if n_triggers < self.window_size:
+        if finite_quota_active and n_triggers < self.window_size:
             logger.warning(
                 "Number of triggers ({}) is less than window size ({}). Using smaller window.",
                 n_triggers,
@@ -195,6 +245,18 @@ class Flex(Processor):
         have different invariants, such as allowing self-weights or not using
         a minimum accepted-epoch count.
         """
+        if self.matrix_decisions is not None:
+            try:
+                metadata = MatrixMetadata.from_processing_context(context)
+                AveragingMatrixBuilder(self.matrix_decisions).candidate_pool(
+                    target_idx=0,
+                    n_epochs=len(context.get_triggers()),
+                    metadata=metadata,
+                )
+            except MatrixDecisionError as exc:
+                raise ProcessorValidationError(str(exc)) from exc
+            return
+
         if not (0 < self.threshold <= 1):
             raise ProcessorValidationError(f"threshold must be in (0, 1], got {self.threshold}")
         if isinstance(self.min_accepted, bool) or not isinstance(self.min_accepted, Integral):
@@ -231,6 +293,13 @@ class Flex(Processor):
 
     def _matrix_correlation_threshold(self) -> float:
         """Return the threshold passed to the averaging-matrix hook."""
+        if self.matrix_decisions is not None:
+            scoring_mode = self.matrix_decisions.scoring.mode
+            if scoring_mode not in {
+                CandidateScoringMode.SIGNED_PEARSON,
+                CandidateScoringMode.ABSOLUTE_PEARSON,
+            }:
+                return 0.0
         return float(self.threshold)
 
     @staticmethod
@@ -262,19 +331,25 @@ class Flex(Processor):
             self.name,
             len(channel_indices),
             len(triggers),
-            self.window_size,
+            "global" if self.matrix_decisions is not None and self.matrix_decisions.quota.global_mode else self.window_size,
         )
 
         # --- COMPUTE ---
-        averaging_matrices, artifacts_per_channel = self._build_artifact_templates(
-            context=context,
-            raw=raw,
-            channel_indices=channel_indices,
-            triggers=triggers,
-            artifact_length=artifact_length,
-            artifact_offset=artifact_offset,
-            sfreq=sfreq,
+        self._runtime_matrix_metadata = (
+            MatrixMetadata.from_processing_context(context) if self.matrix_decisions is not None else None
         )
+        try:
+            averaging_matrices, artifacts_per_channel, diagnostic_plot = self._build_artifact_templates(
+                context=context,
+                raw=raw,
+                channel_indices=channel_indices,
+                triggers=triggers,
+                artifact_length=artifact_length,
+                artifact_offset=artifact_offset,
+                sfreq=sfreq,
+            )
+        finally:
+            self._runtime_matrix_metadata = None
         aligned_triggers, estimated_artifacts = self._subtract_artifact_templates(
             raw=raw,
             averaging_matrices=averaging_matrices,
@@ -329,6 +404,7 @@ class Flex(Processor):
             artifact_length=artifact_length,
             artifact_offset=artifact_offset,
             sfreq=sfreq,
+            diagnostic_plot=diagnostic_plot,
         )
 
         # --- RETURN ---
@@ -345,7 +421,7 @@ class Flex(Processor):
         artifact_length: int,
         artifact_offset: float,
         sfreq: float,
-    ) -> tuple[dict[int, np.ndarray], list[np.ndarray]]:
+    ) -> tuple[dict[int, np.ndarray], list[np.ndarray], dict | None]:
         """Build ``A`` and ``N`` while retaining at most one diagnostic ``D``.
 
         Each channel's epoch matrix is discarded as soon as its template
@@ -362,7 +438,7 @@ class Flex(Processor):
             sfreq,
         )
 
-        self._maybe_save_artifact_matrix_plot(
+        diagnostic_plot = self._maybe_save_artifact_matrix_plot(
             context=context,
             raw=raw,
             averaging_matrices=averaging_matrices,
@@ -372,7 +448,7 @@ class Flex(Processor):
         if self.plot_artifacts and artifacts_per_channel:
             self._plot_artifact_debug(raw, averaging_matrices, artifacts_per_channel)
 
-        return averaging_matrices, artifacts_per_channel
+        return averaging_matrices, artifacts_per_channel, diagnostic_plot
 
     def _subtract_artifact_templates(
         self,
@@ -431,6 +507,7 @@ class Flex(Processor):
         artifact_length: int,
         artifact_offset: float,
         sfreq: float,
+        diagnostic_plot: dict | None,
     ) -> ProcessingContext:
         """Attach a JSON-friendly report of the template matrix calculation."""
         metadata = context.metadata.copy()
@@ -447,6 +524,8 @@ class Flex(Processor):
                 sfreq=sfreq,
             )
         )
+        if diagnostic_plot is not None:
+            metadata.custom.setdefault("artifact_template_matrix_plots", []).append(diagnostic_plot)
         return context.with_metadata(
             metadata,
             copy_estimated_noise=False,
@@ -480,7 +559,7 @@ class Flex(Processor):
                 }
             )
 
-        return {
+        report = {
             "processor_name": self.name,
             "processor_type": self.__class__.__name__,
             "description": self.description,
@@ -498,6 +577,9 @@ class Flex(Processor):
             "sampling_rate_hz": float(sfreq),
             "channels": channels,
         }
+        if self._last_matrix_decision_manifest is not None:
+            report["matrix_decisions"] = self._last_matrix_decision_manifest
+        return report
 
     def _serialize_averaging_matrix(self, matrix: np.ndarray) -> dict:
         """Return a dense or sparse JSON-friendly representation of ``A``."""
@@ -951,29 +1033,38 @@ class Flex(Processor):
         averaging_matrices: dict[int, np.ndarray],
         epoch_matrices_per_channel: dict[int, np.ndarray],
         sfreq: float,
-    ) -> None:
+    ) -> dict | None:
         """Save a diagnostic plot using a representative EEG channel.
 
         The historical ``.aas_matrices.png`` suffix is retained for existing
         pipelines even though Flex now owns the common matrix engine.
         """
         if not epoch_matrices_per_channel:
-            return
+            return None
 
         output_path = None
         chunk_metadata = context.metadata.custom.get("chunk", {})
+        plot_records = context.metadata.custom.get("artifact_template_matrix_plots", [])
+        plot_number = len(plot_records) + 1
         if isinstance(chunk_metadata, dict):
             raw_output_path = chunk_metadata.get("output_path")
             if raw_output_path:
-                output_path = Path(str(raw_output_path)).with_suffix(".aas_matrices.png")
+                legacy_path = Path(str(raw_output_path)).with_suffix(".aas_matrices.png")
+                output_path = legacy_path
+                if plot_number > 1:
+                    # A scanner correction followed by BCG correction runs two
+                    # Flex stages in the same chunk.  Preserve the historical
+                    # first filename while preventing later stages from
+                    # overwriting the earlier diagnostic.
+                    output_path = legacy_path.with_name(f"{legacy_path.stem}_{plot_number:02d}{legacy_path.suffix}")
 
         if output_path is None and not self.plot_artifacts:
-            return
+            return None
 
         try:
             processed_channels = list(epoch_matrices_per_channel)
             if not processed_channels:
-                return
+                return None
 
             channel_index = self._select_diagnostic_channel(
                 processed_channels,
@@ -983,7 +1074,7 @@ class Flex(Processor):
 
             if epoch_data.ndim != 2 or epoch_data.size == 0:
                 logger.warning("Cannot create template-matrix diagnostic plot: selected epoch matrix is empty.")
-                return
+                return None
 
             data_minimum = float(np.nanmin(epoch_data))
             data_maximum = float(np.nanmax(epoch_data))
@@ -1007,7 +1098,7 @@ class Flex(Processor):
                     "are constant or effectively zero.",
                     raw.ch_names[channel_index],
                 )
-                return
+                return None
 
             plot_aas_matrices(
                 epoch_data=epoch_data,
@@ -1022,10 +1113,18 @@ class Flex(Processor):
 
             if output_path is not None:
                 logger.info("Saved template-matrix diagnostic plot to {}", output_path)
+                return {
+                    "stage": plot_number,
+                    "processor_name": self.name,
+                    "processor_type": self.__class__.__name__,
+                    "channel_name": raw.ch_names[channel_index],
+                    "path": str(output_path),
+                }
         except Exception as exc:
             # Plotting is diagnostic-only and must never discard a completed
             # correction when a GUI/backend or malformed channel fails.
             logger.warning("Failed to save template-matrix diagnostic plot: {}", exc)
+        return None
 
     @staticmethod
     def _select_diagnostic_channel(
@@ -1176,104 +1275,41 @@ class Flex(Processor):
         rel_window_offset: float,
         correlation_threshold: float,
     ) -> np.ndarray:
-        """Build the flexible epoch-averaging matrix for one channel.
-
-        Parameters
-        ----------
-        epochs : np.ndarray
-            Epoch data matrix with shape ``(n_epochs, n_samples)``.
-        window_size : int
-            Maximum number of non-target candidate epochs per row.
-        rel_window_offset : float
-            Unused shared matrix-hook argument. Flex always prioritizes future
-            epochs and only backfills from preceding epochs at the recording
-            end.
-        correlation_threshold : float
-            Signed Pearson correlation cutoff for automatic acceptance.
-
-        Returns
-        -------
-        np.ndarray
-            Square averaging matrix. Except for the zero- or one-epoch edge
-            case, every row is finite, has a zero diagonal, and sums to one.
-        """
+        """Delegate construction of ``A`` to the composable decision builder."""
         del rel_window_offset
 
         n_epochs = int(epochs.shape[0])
-        averaging_matrix = np.zeros((n_epochs, n_epochs), dtype=float)
-        self._require_finite_epoch_data(epochs)
-        if n_epochs < 2 or window_size < 1:
-            return averaging_matrix
-
-        effective_window_size = min(window_size, n_epochs - 1)
-
-        for target_idx in range(n_epochs):
-            candidate_indices = self._candidate_indices(
-                target_idx=target_idx,
-                n_epochs=n_epochs,
-                window_size=effective_window_size,
-            )
-            correlations = self._pearson_correlations(
-                target_epoch=epochs[target_idx],
-                candidate_epochs=epochs[candidate_indices],
-            )
-            selected_indices = self._select_epoch_indices(
-                target_idx=target_idx,
-                candidate_indices=candidate_indices,
-                correlations=correlations,
+        if self.matrix_decisions is None:
+            effective_window_size = min(window_size, max(n_epochs - 1, 1))
+            decisions = MatrixDecisions.legacy_flex(
+                window_size=window_size,
                 threshold=correlation_threshold,
-            )
-            weights = self._selection_weights(
-                target_idx=target_idx,
-                selected_indices=selected_indices,
+                min_accepted=self.min_accepted,
+                distribution=self.N_distribution,
                 effective_window_size=effective_window_size,
             )
-            averaging_matrix[target_idx, selected_indices] = weights
+            metadata = MatrixMetadata()
+        else:
+            decisions = self.matrix_decisions
+            metadata = self._runtime_matrix_metadata or MatrixMetadata()
 
-        return averaging_matrix
+        try:
+            matrix = AveragingMatrixBuilder(decisions).build(epochs, metadata=metadata)
+        except MatrixDecisionError as exc:
+            raise ProcessorValidationError(str(exc)) from exc
+
+        self._last_matrix_decision_manifest = decisions.to_dict()
+        return matrix
 
     @staticmethod
     def _candidate_indices(target_idx: int, n_epochs: int, window_size: int) -> np.ndarray:
-        """Return a future-first window, backfilled with preceding epochs.
-
-        The returned indices are chronological for stable diagnostics. Future
-        epochs determine the window whenever enough are present; preceding
-        epochs only fill positions that would otherwise be missing.
-        """
-        candidate_count = min(window_size, n_epochs - 1)
-        forward_stop = min(n_epochs, target_idx + 1 + candidate_count)
-        forward_indices = np.arange(target_idx + 1, forward_stop, dtype=int)
-
-        backfill_count = candidate_count - len(forward_indices)
-        backfill_start = max(0, target_idx - backfill_count)
-        backfill_indices = np.arange(backfill_start, target_idx, dtype=int)
-
-        return np.concatenate((backfill_indices, forward_indices))
+        """Compatibility wrapper for the default future-first quota."""
+        return future_first_candidate_indices(target_idx, n_epochs, window_size)
 
     @staticmethod
     def _pearson_correlations(target_epoch: np.ndarray, candidate_epochs: np.ndarray) -> np.ndarray:
-        """Calculate robust signed Pearson correlations against one target.
-
-        Undefined correlations from constant or non-finite epochs are stored
-        as negative infinity. They cannot pass the threshold, but remain
-        deterministic last-resort candidates when ``min_accepted`` must be
-        satisfied.
-        """
-        target_centered = target_epoch - np.mean(target_epoch)
-        candidates_centered = candidate_epochs - np.mean(candidate_epochs, axis=1, keepdims=True)
-
-        numerators = candidates_centered @ target_centered
-        target_norm = np.linalg.norm(target_centered)
-        candidate_norms = np.linalg.norm(candidates_centered, axis=1)
-        denominators = candidate_norms * target_norm
-
-        correlations = np.full(len(candidate_epochs), -np.inf, dtype=float)
-        valid = np.isfinite(numerators) & np.isfinite(denominators) & (denominators > 0.0)
-        np.divide(numerators, denominators, out=correlations, where=valid)
-
-        finite = np.isfinite(correlations)
-        correlations[finite] = np.clip(correlations[finite], -1.0, 1.0)
-        return correlations
+        """Compatibility wrapper for robust signed Pearson scores."""
+        return pearson_scores(target_epoch, candidate_epochs, CorrelationMode.SIGNED)
 
     def _select_epoch_indices(
         self,
@@ -1282,26 +1318,23 @@ class Flex(Processor):
         correlations: np.ndarray,
         threshold: float,
     ) -> np.ndarray:
-        """Select threshold matches and supplement them to the minimum count."""
-        accepted = np.isfinite(correlations) & (correlations >= threshold)
-        required_count = min(self.min_accepted, len(candidate_indices))
-        accepted_count = int(np.count_nonzero(accepted))
-
-        if accepted_count < required_count:
-            # The first sort key is descending signed correlation. Distance and
-            # absolute index make otherwise identical choices deterministic.
-            distances = np.abs(candidate_indices - target_idx)
-            ranked_positions = np.lexsort((candidate_indices, distances, -correlations))
-
-            for candidate_position in ranked_positions:
-                if accepted[candidate_position]:
-                    continue
-                accepted[candidate_position] = True
-                accepted_count += 1
-                if accepted_count >= required_count:
-                    break
-
-        return candidate_indices[accepted]
+        """Compatibility wrapper for threshold-plus-minimum selection."""
+        policy = CorrelationPolicy(
+            mode=CorrelationMode.SIGNED,
+            threshold=threshold,
+            min_accepted=self.min_accepted,
+        )
+        # The legacy helper historically exposed selected indices in
+        # chronological order. Ranking still determines membership; sorting
+        # here preserves that public compatibility detail.
+        return np.sort(
+            select_by_correlation(
+                candidate_indices,
+                correlations,
+                policy,
+                target_idx=target_idx,
+            )
+        )
 
     def _selection_weights(
         self,

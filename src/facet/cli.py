@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import json
 import sys
+from collections import Counter
 from collections.abc import Sequence
 from pathlib import Path
 
@@ -36,6 +37,7 @@ from ._cli_bids import (
     _sanitize_bids_label,
 )
 from ._cli_bids import _run_to_bids as _run_to_bids_impl
+from ._cli_html_report import cleaning_report_path, write_cleaning_report
 from ._cli_inputs import (
     _is_supported_eeg_path,
     _normalise_extension,
@@ -71,6 +73,7 @@ from ._cli_pipeline import (
 from ._cli_reports import (
     _chunk_report,
     _chunked_results,
+    _collect_artifact_template_plots,
     _collect_artifact_template_reports,
     _json_safe,
     _processing_failure_record,
@@ -80,6 +83,7 @@ from ._cli_reports import (
     _write_pipeline_description,
     _write_processing_error,
 )
+from .logging_config import recording_log
 
 __all__ = [
     "ADD_ON_MODE_DESCRIPTIONS",
@@ -102,6 +106,7 @@ __all__ = [
     "_build_template_correction",
     "_chunk_report",
     "_chunked_results",
+    "_collect_artifact_template_plots",
     "_collect_artifact_template_reports",
     "_common_template_kwargs",
     "_deduplicate_runs",
@@ -321,59 +326,128 @@ def _run_process(args: argparse.Namespace) -> int:
     pipeline = _build_processing_pipeline(args)
     success = True
     failures: list[dict[str, str]] = []
+    flat_batch = bool(args.flat_output and len(input_paths) > 1)
+    default_target_dirs = [
+        _source_output_dir(input_path, output_root, len(input_paths), args.flat_output) for input_path in input_paths
+    ]
+    target_dir_counts = Counter(default_target_dirs)
+    colliding_target_dirs = {target_dir for target_dir, count in target_dir_counts.items() if count > 1}
 
-    for input_path in input_paths:
-        target_dir = _source_output_dir(input_path, output_root, len(input_paths), args.flat_output)
+    for input_path, default_target_dir in zip(input_paths, default_target_dirs, strict=True):
+        target_dir = default_target_dir
+        if not args.flat_output and target_dir in colliding_target_dirs:
+            unique_label = cleaning_report_path(
+                output_root,
+                input_path,
+                disambiguate=True,
+            ).name.removesuffix("_cleaning_report.html")
+            target_dir = output_root / unique_label
         target_dir.mkdir(parents=True, exist_ok=True)
-        logger.info("Processing '{}' -> '{}'", input_path, target_dir)
+        html_report_path = cleaning_report_path(
+            target_dir,
+            input_path,
+            disambiguate=flat_batch,
+        )
+        report_stem = html_report_path.name.removesuffix("_cleaning_report.html")
+        log_path = target_dir / f"{report_stem}_facetpy.log"
+        quality_metrics_path = target_dir / (
+            f"{report_stem}_quality_metrics.json" if flat_batch else "quality_metrics.json"
+        )
+        recording_log_context = recording_log(log_path)
+        recording_log_context.__enter__()
 
         try:
-            chunk_by_trigger_sections = not args.fixed_length_chunks
-            if args.pattern == "bcg":
-                # QRSTriggerDetector has no regex-based probe path, so BCG uses
-                # fixed-length chunks unless the user later builds a custom flow.
-                chunk_by_trigger_sections = False
+            logger.info("Processing '{}' -> '{}'", input_path, target_dir)
+            logger.info("Recording log: {}", log_path)
+            try:
+                chunk_by_trigger_sections = not args.fixed_length_chunks
+                if args.pattern == "bcg":
+                    # QRSTriggerDetector has no regex-based probe path, so BCG uses
+                    # fixed-length chunks unless the user later builds a custom flow.
+                    chunk_by_trigger_sections = False
 
-            result = pipeline.run_chunked(
-                input_path=str(input_path),
-                output_dir=str(target_dir),
-                output_extension=args.output_extension,
-                min_chunks=args.min_chunks,
-                max_chunks=args.max_chunks,
-                max_memory_mb=args.max_memory_mb,
-                memory_fraction=args.memory_fraction,
-                disable_chunking=args.disable_chunking,
-                force_full_run=args.force_full_run,
-                overwrite=args.overwrite,
-                channel_sequential=args.channel_sequential,
-                on_error=args.on_error,
-                keep_raw=False,
-                chunk_by_trigger_sections=chunk_by_trigger_sections,
-                trigger_section_padding_seconds=args.trigger_section_padding_seconds,
-                trigger_section_min_triggers=args.trigger_section_min_triggers,
-                trigger_section_gap_seconds=args.trigger_section_gap_seconds,
-                trigger_section_max_sections=args.trigger_section_max_sections,
-            )
-        except Exception as exc:
-            success = False
-            record = _processing_failure_record(input_path, target_dir, exc)
-            failures.append(record)
-            marker_path = _write_processing_error(target_dir, record)
-            logger.error("Processing failed for '{}': {}", input_path, exc)
-            logger.warning("Recorded failure marker: {}", marker_path)
-            if args.on_error == "raise":
-                raise
-            logger.warning("Continuing to next input because --on-error=continue")
-            continue
+                result = pipeline.run_chunked(
+                    input_path=str(input_path),
+                    output_dir=str(target_dir),
+                    output_extension=args.output_extension,
+                    output_stem=report_stem if flat_batch else None,
+                    min_chunks=args.min_chunks,
+                    max_chunks=args.max_chunks,
+                    max_memory_mb=args.max_memory_mb,
+                    memory_fraction=args.memory_fraction,
+                    disable_chunking=args.disable_chunking,
+                    force_full_run=args.force_full_run,
+                    overwrite=args.overwrite,
+                    channel_sequential=args.channel_sequential,
+                    on_error=args.on_error,
+                    keep_raw=False,
+                    chunk_by_trigger_sections=chunk_by_trigger_sections,
+                    trigger_section_padding_seconds=args.trigger_section_padding_seconds,
+                    trigger_section_min_triggers=args.trigger_section_min_triggers,
+                    trigger_section_gap_seconds=args.trigger_section_gap_seconds,
+                    trigger_section_max_sections=args.trigger_section_max_sections,
+                )
 
-        result.print_summary()
-        matrix_report_path = _write_artifact_template_matrix_report(target_dir, input_path, result)
-        description_path = _write_pipeline_description(
-            target_dir, input_path, args, pipeline, result, matrix_report_path
-        )
-        logger.info("Wrote pipeline description: {}", description_path)
-        logger.info("Wrote artifact template matrix report: {}", matrix_report_path)
-        success = success and result.was_successful()
+                if flat_batch and getattr(result, "manifest_path", None) is not None:
+                    current_manifest = Path(result.manifest_path)
+                    unique_manifest = target_dir / f"{report_stem}_chunks_manifest.json"
+                    current_manifest.replace(unique_manifest)
+                    result.manifest_path = unique_manifest
+
+                result.print_summary()
+                matrix_filename = (
+                    f"{report_stem}_artifact_template_matrices.json"
+                    if flat_batch
+                    else "artifact_template_matrices.json"
+                )
+                pipeline_filename = (
+                    f"{report_stem}_pipeline_description.json" if flat_batch else "pipeline_description.json"
+                )
+                matrix_report_path = _write_artifact_template_matrix_report(
+                    target_dir,
+                    input_path,
+                    result,
+                    filename=matrix_filename,
+                )
+                description_path = _write_pipeline_description(
+                    target_dir,
+                    input_path,
+                    args,
+                    pipeline,
+                    result,
+                    matrix_report_path,
+                    html_report_path,
+                    log_path,
+                    quality_metrics_path,
+                    filename=pipeline_filename,
+                )
+                report_path = write_cleaning_report(
+                    target_dir=target_dir,
+                    input_path=input_path,
+                    chunked_result=result,
+                    pipeline_description_path=description_path,
+                    matrix_report_path=matrix_report_path,
+                    quality_metrics_path=quality_metrics_path,
+                    output_path=html_report_path,
+                )
+                logger.info("Wrote pipeline description: {}", description_path)
+                logger.info("Wrote artifact template matrix report: {}", matrix_report_path)
+                logger.info("Wrote quality metrics: {}", quality_metrics_path)
+                logger.info("Wrote EEG cleaning report: {}", report_path)
+                success = success and result.was_successful()
+            except Exception as exc:
+                success = False
+                record = _processing_failure_record(input_path, target_dir, exc)
+                failures.append(record)
+                marker_path = _write_processing_error(target_dir, record)
+                logger.error("Processing failed for '{}': {}", input_path, exc)
+                logger.warning("Recorded failure marker: {}", marker_path)
+                if args.on_error == "raise":
+                    raise
+                logger.warning("Continuing to next input because --on-error=continue")
+                continue
+        finally:
+            recording_log_context.__exit__(*sys.exc_info())
 
     failure_manifest = _write_batch_failures(output_root, failures)
     if failure_manifest is not None:

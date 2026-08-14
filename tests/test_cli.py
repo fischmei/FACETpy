@@ -2,12 +2,14 @@
 
 import argparse
 import json
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
 
 from facet import cli
 from facet.core import Pipeline, ProcessorValidationError
+from facet.correction import Flex
 
 pytestmark = pytest.mark.unit
 
@@ -90,6 +92,129 @@ def test_process_command_batches_into_recording_folders(monkeypatch, tmp_path):
     ]
     assert all(call["kwargs"]["chunk_by_trigger_sections"] for call in calls)
     assert all("drop_channels_matching" not in call["processor_names"] for call in calls)
+    for recording in ("sub01", "sub02"):
+        recording_dir = tmp_path / "corrected" / recording
+        assert len(list(recording_dir.glob("*_facetpy.log"))) == 1
+        assert (recording_dir / "quality_metrics.json").exists()
+
+
+def test_flat_batch_report_and_json_names_do_not_collide(monkeypatch, tmp_path):
+    """Shared output folders should retain provenance for equal source basenames."""
+    first = tmp_path / "site-a" / "recording.edf"
+    second = tmp_path / "site-b" / "recording.edf"
+    first.parent.mkdir()
+    second.parent.mkdir()
+    first.touch()
+    second.touch()
+    output_dir = tmp_path / "corrected"
+    output_stems = []
+
+    def fake_run_chunked(self, **kwargs):
+        output_stems.append(kwargs["output_stem"])
+        manifest_path = Path(kwargs["output_dir"]) / "chunks_manifest.json"
+        manifest_path.write_text(json.dumps({"source_path": kwargs["input_path"]}), encoding="utf-8")
+        result = _DummyChunkedResult()
+        result.manifest_path = manifest_path
+        return result
+
+    monkeypatch.setattr(Pipeline, "run_chunked", fake_run_chunked)
+
+    status = cli.main(
+        [
+            "process",
+            "--input",
+            str(first),
+            "--input",
+            str(second),
+            "--output-dir",
+            str(output_dir),
+            "--flat-output",
+        ]
+    )
+
+    assert status == 0
+    assert len(list(output_dir.glob("recording_*_cleaning_report.html"))) == 2
+    assert len(list(output_dir.glob("recording_*_pipeline_description.json"))) == 2
+    assert len(list(output_dir.glob("recording_*_artifact_template_matrices.json"))) == 2
+    assert len(list(output_dir.glob("recording_*_chunks_manifest.json"))) == 2
+    assert len(list(output_dir.glob("recording_*_facetpy.log"))) == 2
+    assert len(list(output_dir.glob("recording_*_quality_metrics.json"))) == 2
+    assert len(set(output_stems)) == 2
+
+
+def test_equal_basenames_use_distinct_recording_folders(monkeypatch, tmp_path):
+    """Default batch folders should not collide for sources from different sites."""
+    first = tmp_path / "site-a" / "recording.edf"
+    second = tmp_path / "site-b" / "recording.edf"
+    first.parent.mkdir()
+    second.parent.mkdir()
+    first.touch()
+    second.touch()
+    output_dirs = []
+
+    def fake_run_chunked(self, **kwargs):
+        output_dirs.append(Path(kwargs["output_dir"]))
+        return _DummyChunkedResult()
+
+    monkeypatch.setattr(Pipeline, "run_chunked", fake_run_chunked)
+
+    status = cli.main(
+        [
+            "process",
+            "--input",
+            str(first),
+            "--input",
+            str(second),
+            "--output-dir",
+            str(tmp_path / "corrected"),
+        ]
+    )
+
+    assert status == 0
+    assert len(set(output_dirs)) == 2
+    assert all(path.name.startswith("recording_") for path in output_dirs)
+    assert all((path / "recording_cleaning_report.html").exists() for path in output_dirs)
+
+
+def test_report_failure_obeys_continue_policy(monkeypatch, tmp_path):
+    """A report failure should be recorded without aborting the remaining batch."""
+    first = tmp_path / "first.edf"
+    second = tmp_path / "second.edf"
+    first.touch()
+    second.touch()
+    output_dir = tmp_path / "corrected"
+    report_calls = []
+
+    monkeypatch.setattr(Pipeline, "run_chunked", lambda self, **kwargs: _DummyChunkedResult())
+
+    def fake_report_writer(**kwargs):
+        report_calls.append(kwargs["input_path"])
+        if len(report_calls) == 1:
+            raise RuntimeError("report render failed")
+        kwargs["output_path"].write_text("<html>ok</html>", encoding="utf-8")
+        return kwargs["output_path"]
+
+    monkeypatch.setattr(cli, "write_cleaning_report", fake_report_writer)
+
+    status = cli.main(
+        [
+            "process",
+            "--input",
+            str(first),
+            "--input",
+            str(second),
+            "--output-dir",
+            str(output_dir),
+            "--on-error",
+            "continue",
+        ]
+    )
+
+    assert status == 1
+    assert report_calls == [first.resolve(), second.resolve()]
+    error_payload = json.loads((output_dir / "first" / "processing_error.json").read_text(encoding="utf-8"))
+    assert error_payload["error"] == "report render failed"
+    assert (output_dir / "second" / "second_cleaning_report.html").exists()
 
 
 def test_process_command_forwards_memory_and_full_run_controls(monkeypatch, tmp_path):
@@ -125,7 +250,7 @@ def test_process_command_forwards_memory_and_full_run_controls(monkeypatch, tmp_
 
 
 def test_process_command_can_opt_in_to_egi_channel_drop(monkeypatch, tmp_path):
-    """EGI channel dropping should remain available when explicitly requested."""
+    """EGI channel dropping should work with the default standard pattern."""
     source = tmp_path / "sub-01.mff"
     source.mkdir()
 
@@ -153,9 +278,17 @@ def test_process_command_can_opt_in_to_egi_channel_drop(monkeypatch, tmp_path):
         [
             "drop_channels_matching",
             "trigger_detector",
+            "cut_acquisition_window",
+            "highpass_filter",
             "upsample",
-            "aas_correction",
+            "slice_aligner",
+            "subsample_aligner",
+            "aas_flex_correction",
+            "pca_correction",
             "downsample",
+            "paste_acquisition_window",
+            "lowpass_filter",
+            "anc_correction",
         ]
     ]
 
@@ -180,6 +313,8 @@ def test_process_command_builds_selected_correction_modes(monkeypatch, tmp_path)
             str(source),
             "--output-dir",
             str(tmp_path / "corrected"),
+            "--pattern",
+            "quickstart",
             "--correction-mode",
             "farm",
             "--farm-correlation-threshold",
@@ -206,12 +341,12 @@ def test_process_command_builds_selected_correction_modes(monkeypatch, tmp_path)
         "trigger_detector",
         "upsample",
         "volume_artifact_correction",
-        "farm_correction",
+        "farm_flex_correction",
         "pca_correction",
         "downsample",
         "anc_correction",
         "qrs_trigger_detector",
-        "aas_correction",
+        "bcg_aas_flex_correction",
     ]
     assert processors[3].correlation_threshold == 0.91
     assert processors[4].n_components == "auto"
@@ -239,6 +374,8 @@ def test_process_command_builds_flex_correction(monkeypatch, tmp_path):
             str(source),
             "--output-dir",
             str(tmp_path / "corrected"),
+            "--pattern",
+            "quickstart",
             "--correction-mode",
             "flex",
             "--window-size",
@@ -259,6 +396,46 @@ def test_process_command_builds_flex_correction(monkeypatch, tmp_path):
     assert correction.threshold == 0.91
     assert correction.min_accepted == 4
     assert correction.N_distribution == "normal"
+
+
+@pytest.mark.parametrize(
+    ("mode", "preset"),
+    [
+        ("aas", "aas_per_target"),
+        ("farm", "farm_per_target_k10"),
+        ("flex", "flex_default"),
+        ("volume-trigger", "structural_volume"),
+        ("slice-trigger", "structural_slice"),
+        ("corresponding-slice", "corresponding_slice"),
+        ("moosmann", "moosmann_cost"),
+    ],
+)
+def test_every_cli_correction_mode_builds_flex(mode, preset):
+    """Correction-mode selection must never instantiate archived engines."""
+    parser = cli._build_parser()
+    args = parser.parse_args(
+        [
+            "process",
+            "--input",
+            "recording.edf",
+            "--output-dir",
+            "corrected",
+            "--correction-mode",
+            mode,
+        ]
+    )
+
+    processor = cli._build_template_correction(args)
+
+    assert type(processor) is Flex
+    assert processor.flex_preset_name == preset
+
+
+def test_process_parser_defaults_to_standard_pattern():
+    """The full standard workflow should be selected unless overridden."""
+    args = cli._build_parser().parse_args(["process", "--input", "recording.edf", "--output-dir", "corrected"])
+
+    assert args.pattern == "standard"
 
 
 def test_process_command_writes_pipeline_and_matrix_reports(monkeypatch, tmp_path):
@@ -330,6 +507,7 @@ def test_process_command_writes_pipeline_and_matrix_reports(monkeypatch, tmp_pat
     assert status == 0
     pipeline_payload = json.loads((output_dir / "pipeline_description.json").read_text(encoding="utf-8"))
     matrix_payload = json.loads((output_dir / "artifact_template_matrices.json").read_text(encoding="utf-8"))
+    html_report = output_dir / "sub-01_cleaning_report.html"
 
     assert pipeline_payload["correction_mode"] == "aas"
     assert pipeline_payload["bcg_enabled"] is True
@@ -338,6 +516,17 @@ def test_process_command_writes_pipeline_and_matrix_reports(monkeypatch, tmp_pat
     assert matrix_payload["description"].startswith("Flex-based corrections build artifact templates")
     assert matrix_payload["reports"][0]["processor_name"] == "aas_correction"
     assert matrix_payload["reports"][0]["chunk"]["index"] == 1
+    assert pipeline_payload["result"]["html_cleaning_report"] == str(html_report)
+    assert pipeline_payload["result"]["log_file"].endswith("sub-01_facetpy.log")
+    assert pipeline_payload["result"]["quality_metrics_report"].endswith("quality_metrics.json")
+    quality_payload = json.loads((output_dir / "quality_metrics.json").read_text(encoding="utf-8"))
+    assert "theta_preservation" in quality_payload["metrics"]
+    assert "alpha_preservation" in quality_payload["metrics"]
+    assert "nonpeak_beta_preservation" in quality_payload["metrics"]
+    log_text = (output_dir / "sub-01_facetpy.log").read_text(encoding="utf-8")
+    assert "Quality metric theta_preservation" in log_text
+    assert html_report.exists()
+    assert "Before, during, and after cleaning" in html_report.read_text(encoding="utf-8")
 
 
 def test_process_command_builds_standard_pattern(monkeypatch, tmp_path):
@@ -374,7 +563,7 @@ def test_process_command_builds_standard_pattern(monkeypatch, tmp_path):
         "upsample",
         "slice_aligner",
         "subsample_aligner",
-        "aas_correction",
+        "aas_flex_correction",
         "pca_correction",
         "downsample",
         "paste_acquisition_window",
@@ -416,7 +605,7 @@ def test_standard_pattern_can_add_bcg_mode(monkeypatch, tmp_path):
         "lowpass_filter",
         "anc_correction",
         "qrs_trigger_detector",
-        "aas_correction",
+        "bcg_aas_flex_correction",
     ]
 
 
@@ -440,6 +629,8 @@ def test_process_command_can_add_bcg_mode(monkeypatch, tmp_path):
             str(source),
             "--output-dir",
             str(tmp_path / "corrected"),
+            "--pattern",
+            "quickstart",
             "--mode",
             "bcg",
         ]
@@ -450,10 +641,10 @@ def test_process_command_can_add_bcg_mode(monkeypatch, tmp_path):
         [
             "trigger_detector",
             "upsample",
-            "aas_correction",
+            "aas_flex_correction",
             "downsample",
             "qrs_trigger_detector",
-            "aas_correction",
+            "bcg_aas_flex_correction",
         ]
     ]
 
@@ -490,7 +681,7 @@ def test_process_command_builds_bcg_pattern_with_fixed_chunks(monkeypatch, tmp_p
 
     assert status == 0
     assert calls[0]["kwargs"]["chunk_by_trigger_sections"] is False
-    assert calls[0]["processor_names"] == ["qrs_trigger_detector", "aas_correction"]
+    assert calls[0]["processor_names"] == ["qrs_trigger_detector", "bcg_aas_flex_correction"]
 
 
 def test_process_command_moosmann_requires_motion_file(tmp_path):

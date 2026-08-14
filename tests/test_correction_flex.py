@@ -93,7 +93,7 @@ class TestFlexPublicAPI:
             "min_accepted",
             "N_distribution",
         ]
-        assert [parameter.default for parameter in parameters[:4]] == [30, 0.975, 5, "equal"]
+        assert [parameter.default for parameter in parameters[:4]] == [10, 0.975, 5, "equal"]
 
     def test_parameters_are_canonical_and_constructor_compatible(self):
         """History parameters should recreate the exact processor configuration."""
@@ -262,8 +262,8 @@ class TestFlexAveragingMatrix:
         np.testing.assert_allclose(np.diag(matrix), 0.0)
         np.testing.assert_allclose(matrix.sum(axis=1), 1.0)
 
-    def test_constant_epochs_fall_back_deterministically_without_nan(self):
-        """Undefined correlations should still produce valid minimum-size rows."""
+    def test_constant_epochs_leave_empty_rows_without_invalid_supplementation(self):
+        """Undefined correlations must not pass or supplement the minimum."""
         epochs = np.ones((4, 8), dtype=float)
         processor = Flex(window_size=3, threshold=0.9, min_accepted=2, N_distribution="equal")
 
@@ -271,18 +271,18 @@ class TestFlexAveragingMatrix:
 
         assert np.all(np.isfinite(matrix))
         np.testing.assert_allclose(np.diag(matrix), 0.0)
-        np.testing.assert_allclose(matrix.sum(axis=1), 1.0)
-        np.testing.assert_array_equal(np.count_nonzero(matrix, axis=1), np.full(4, 2))
-        np.testing.assert_allclose(matrix[0], [0.0, 0.5, 0.5, 0.0])
+        np.testing.assert_array_equal(matrix, np.zeros((4, 4)))
 
-    def test_nonfinite_epoch_data_is_rejected_before_matrix_multiplication(self):
-        """NaN or infinite samples must not contaminate every artifact template."""
+    def test_nonfinite_candidate_correlation_cannot_be_selected(self):
+        """A non-finite candidate receives no weight during correlation selection."""
         epochs = np.arange(32, dtype=float).reshape(4, 8)
         epochs[2, 3] = np.nan
         processor = Flex(window_size=3, threshold=0.9, min_accepted=2)
 
-        with pytest.raises(ProcessorValidationError, match="requires finite epoch data"):
-            _averaging_matrix(processor, epochs)
+        matrix = _averaging_matrix(processor, epochs)
+
+        assert np.all(np.isfinite(matrix))
+        np.testing.assert_array_equal(matrix[:, 2], np.zeros(4))
 
     def test_empty_and_single_epoch_matrices_have_defined_zero_shape(self):
         """Private matrix construction should remain total at extraction edges."""

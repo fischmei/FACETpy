@@ -8,7 +8,6 @@ from collections.abc import Sequence
 from pathlib import Path
 
 from facet import (
-    AASCorrection,
     CutAcquisitionWindow,
     DownSample,
     DropChannelsMatching,
@@ -23,14 +22,24 @@ from facet import (
     UpSample,
 )
 from facet.correction import (
-    CorrespondingSliceCorrection,
-    FARMCorrection,
     Flex,
-    MoosmannCorrection,
-    SliceTriggerCorrection,
     VolumeArtifactCorrection,
-    VolumeTriggerCorrection,
+    WeightingPolicy,
 )
+from facet.correction.presets import (
+    AAS_PER_TARGET,
+    CLI_CORRECTION_PRESETS,
+    CORRESPONDING_SLICE,
+    FARM_PER_TARGET_K10,
+    FLEX_DEFAULT,
+    LEGACY_RESEMBLANCE,
+    MOOSMANN_COST,
+    STRUCTURAL_SLICE,
+    STRUCTURAL_VOLUME,
+    build_flex_preset,
+)
+
+from ._cli_motion import CLIMotionMetadataInjector, CLISlicesPerVolumeInjector
 
 try:
     from facet.correction import ANCCorrection
@@ -45,13 +54,13 @@ except ImportError:  # pragma: no cover - depends on optional scientific stack
 DEFAULT_EGI_DROP_REGEX = r"^E(?:[1-9]|[1-9]\d|1[01]\d|12[0-8])$"
 
 CORRECTION_MODE_DESCRIPTIONS = {
-    "aas": "Baseline Averaged Artifact Subtraction.",
-    "farm": "FACET FARM-style template weighting for similar artifact epochs.",
-    "flex": "Flexible correlation selection with a configurable minimum and equal or normal weighting.",
-    "volume-trigger": "FACET volume-trigger template weighting.",
-    "slice-trigger": "FACET slice-trigger odd/even template weighting.",
-    "corresponding-slice": "Average corresponding slice positions across volumes.",
-    "moosmann": "Motion-informed template weighting from an SPM realignment-parameter file.",
+    "aas": "Flex configured as the closest per-target AAS recipe.",
+    "farm": "Flex configured as the FARM-like absolute-correlation recipe.",
+    "flex": "Default composable Flex correlation recipe.",
+    "volume-trigger": "Flex configured for fixed neighboring-volume structure.",
+    "slice-trigger": "Flex configured for odd/even slice-trigger structure.",
+    "corresponding-slice": "Flex configured for matching slice phases across volumes.",
+    "moosmann": "Flex configured with motion-path costs from an SPM realignment file.",
 }
 ADD_ON_MODE_DESCRIPTIONS = {
     "volume-artifact": "Correct transition artifacts around slice-trigger volume gaps before template subtraction.",
@@ -60,16 +69,16 @@ ADD_ON_MODE_DESCRIPTIONS = {
     "bcg": "Apply QRS-triggered BCG artifact correction after scanner-template correction.",
 }
 CORRECTION_MATRIX_DESCRIPTIONS = {
-    "aas": "AAS builds A with correlation-selected epochs from sliding windows.",
-    "farm": "FARM builds A from the most correlated neighboring epochs above threshold.",
+    "aas": "Flex uses future candidates, includes the target, and enforces at least five signed-correlation matches.",
+    "farm": "Flex keeps at most ten absolute-correlation matches from a symmetric thirty-candidate window.",
     "flex": (
         "Flex builds each row of A from a future-first correlation window, backfilled with preceding epochs, "
         "then supplements threshold matches to a configurable minimum and applies equal or normal weights."
     ),
-    "volume-trigger": "Volume-trigger correction builds A from fixed neighboring volume-trigger epochs.",
-    "slice-trigger": "Slice-trigger correction builds A from alternating odd/even slice-trigger epochs.",
-    "corresponding-slice": "Corresponding-slice correction builds A from the same slice position across volumes.",
-    "moosmann": "Moosmann correction builds A from motion-informed realignment-parameter weights.",
+    "volume-trigger": "Flex selects all candidates in a past-heavy structural volume window, including the target.",
+    "slice-trigger": "Flex selects alternating future slice-trigger epochs with no correlation scoring.",
+    "corresponding-slice": "Flex samples the same slice phase in neighboring volumes and includes the target.",
+    "moosmann": "Flex ranks stable candidates by temporal plus cumulative-motion path cost.",
 }
 PROCESS_PATTERN_DESCRIPTIONS = {
     "quickstart": "Memory-light scanner correction. Add --mode bcg for QRS-triggered BCG cleanup.",
@@ -120,7 +129,6 @@ def _selected_add_on_modes(args: argparse.Namespace) -> tuple[list[str], bool]:
 def _common_template_kwargs(args: argparse.Namespace) -> dict:
     """Build options shared by Flex template-matrix processors."""
     return {
-        "window_size": args.window_size,
         "plot_artifacts": args.plot_artifacts,
         "realign_after_averaging": args.realign_after_averaging,
         "search_window_factor": args.search_window_factor,
@@ -130,52 +138,69 @@ def _common_template_kwargs(args: argparse.Namespace) -> dict:
 
 
 def _build_template_correction(args: argparse.Namespace):
-    """Create the selected template-subtraction correction processor."""
+    """Create one Flex processor from the selected named decision recipe."""
     mode = args.correction_mode
     common = _common_template_kwargs(args)
+    preset_name = CLI_CORRECTION_PRESETS.get(mode)
+    if preset_name is None:
+        raise ValueError(f"Unsupported correction mode: {mode}")
 
-    if mode == "aas":
-        return AASCorrection(
-            **common,
-            correlation_threshold=args.aas_correlation_threshold,
-            interpolate_volume_gaps=args.interpolate_volume_gaps,
+    if preset_name == FLEX_DEFAULT:
+        window_size = 10 if args.window_size is None else args.window_size
+        weighting = (
+            WeightingPolicy.equal()
+            if args.flex_distribution == "equal"
+            else WeightingPolicy.gaussian(sigma=max(window_size / 3.0, 1.0))
         )
-    if mode == "farm":
-        return FARMCorrection(
-            **common,
-            correlation_threshold=args.farm_correlation_threshold,
-            search_half_window=args.farm_search_half_window,
-            search_half_window_factor=args.farm_search_half_window_factor,
-            interpolate_volume_gaps=args.interpolate_volume_gaps,
-        )
-    if mode == "flex":
-        return Flex(
-            **common,
+        decisions = build_flex_preset(
+            preset_name,
+            window_size=window_size,
             threshold=args.flex_threshold,
-            min_accepted=args.flex_min_accepted,
-            N_distribution=args.flex_distribution,
-            interpolate_volume_gaps=args.interpolate_volume_gaps,
+            template_size=args.flex_min_accepted,
+            weighting=weighting,
         )
-    if mode == "volume-trigger":
-        return VolumeTriggerCorrection(**common)
-    if mode == "slice-trigger":
-        return SliceTriggerCorrection(**common)
-    if mode == "corresponding-slice":
-        return CorrespondingSliceCorrection(slices_per_volume=args.slices_per_volume, **common)
-    if mode == "moosmann":
-        if args.motion_rp_file is None:
-            raise ValueError("--motion-rp-file is required when --correction-mode=moosmann")
-        rp_file = Path(args.motion_rp_file).expanduser().resolve()
-        if not rp_file.exists():
-            raise FileNotFoundError(f"Motion realignment parameter file not found: {rp_file}")
-        return MoosmannCorrection(
-            rp_file=str(rp_file),
-            motion_threshold=args.motion_threshold,
-            motion_window_size=args.motion_window_size,
-            **common,
+    elif preset_name == AAS_PER_TARGET:
+        decisions = build_flex_preset(
+            preset_name,
+            window_size=10 if args.window_size is None else args.window_size,
+            threshold=args.aas_correlation_threshold,
+        )
+    elif preset_name == FARM_PER_TARGET_K10:
+        farm_window = 30 if args.window_size is None else args.window_size
+        if args.farm_search_half_window is not None:
+            farm_window = 2 * args.farm_search_half_window
+        decisions = build_flex_preset(
+            preset_name,
+            window_size=farm_window,
+            threshold=args.farm_correlation_threshold,
+            template_size=args.farm_template_size,
+        )
+    elif preset_name in {STRUCTURAL_VOLUME, STRUCTURAL_SLICE, CORRESPONDING_SLICE}:
+        decisions = build_flex_preset(
+            preset_name,
+            window_size=10 if args.window_size is None else args.window_size,
+        )
+    else:
+        legacy_window = 30 if args.window_size is None else args.window_size
+        decisions = build_flex_preset(
+            MOOSMANN_COST,
+            template_size=(
+                args.motion_window_size
+                if args.motion_window_size is not None
+                else 2 * legacy_window
+            ),
         )
 
-    raise ValueError(f"Unsupported correction mode: {mode}")
+    processor = Flex(
+        **common,
+        N_distribution=args.flex_distribution if preset_name == FLEX_DEFAULT else "equal",
+        interpolate_volume_gaps=args.interpolate_volume_gaps,
+        matrix_decisions=decisions,
+    )
+    processor.name = "flex_correction" if mode == "flex" else f"{mode.replace('-', '_')}_flex_correction"
+    processor.flex_preset_name = preset_name
+    processor.legacy_algorithm_resemblance = LEGACY_RESEMBLANCE[preset_name]
+    return processor
 
 
 def _build_mode_processors(args: argparse.Namespace) -> tuple[list, list, list]:
@@ -184,6 +209,21 @@ def _build_mode_processors(args: argparse.Namespace) -> tuple[list, list, list]:
     post_template = []
     post_downsample = []
     modes, from_pattern = _selected_add_on_modes(args)
+    if args.correction_mode == "corresponding-slice" and args.slices_per_volume is not None:
+        pre_template.append(CLISlicesPerVolumeInjector(args.slices_per_volume))
+    if args.correction_mode == "moosmann":
+        if args.motion_rp_file is None:
+            raise ValueError("--motion-rp-file is required when --correction-mode=moosmann")
+        rp_file = Path(args.motion_rp_file).expanduser().resolve()
+        if not rp_file.is_file():
+            raise FileNotFoundError(f"Motion realignment parameter file not found: {rp_file}")
+        pre_template.append(
+            CLIMotionMetadataInjector(
+                rp_file=str(rp_file),
+                trigger_regex=args.trigger_regex,
+                motion_threshold=args.motion_threshold,
+            )
+        )
     if "anc" in modes and not args.track_estimated_noise:
         raise ValueError(
             "--no-track-estimated-noise cannot be combined with ANC, which requires the retained artifact estimate."
@@ -278,17 +318,22 @@ def _build_standard_pattern(args: argparse.Namespace) -> list:
 
 def _build_bcg_pattern(args: argparse.Namespace) -> list:
     """Build the BCG/QRS pattern from the quickstart documentation."""
-    return [
-        QRSTriggerDetector(),
-        AASCorrection(
+    correction = Flex(
+        matrix_decisions=build_flex_preset(
+            AAS_PER_TARGET,
             window_size=args.bcg_window_size,
-            correlation_threshold=args.aas_correlation_threshold,
-            plot_artifacts=args.plot_artifacts,
-            realign_after_averaging=args.realign_after_averaging,
-            search_window_factor=args.search_window_factor,
-            apply_epoch_alpha_scaling=args.apply_epoch_alpha_scaling,
+            threshold=args.aas_correlation_threshold,
         ),
-    ]
+        plot_artifacts=args.plot_artifacts,
+        realign_after_averaging=args.realign_after_averaging,
+        search_window_factor=args.search_window_factor,
+        apply_epoch_alpha_scaling=args.apply_epoch_alpha_scaling,
+        track_estimated_noise=args.track_estimated_noise,
+    )
+    correction.name = "bcg_aas_flex_correction"
+    correction.flex_preset_name = AAS_PER_TARGET
+    correction.legacy_algorithm_resemblance = LEGACY_RESEMBLANCE[AAS_PER_TARGET]
+    return [QRSTriggerDetector(), correction]
 
 
 def _build_processing_pipeline(args: argparse.Namespace) -> Pipeline:
