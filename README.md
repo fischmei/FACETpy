@@ -28,6 +28,13 @@ Built on [MNE-Python](https://mne.tools), FACETpy provides a modular pipeline ar
 
 CLI reference PDF: [Download the FACETpy CLI Overview](docs/source/_static/FACETpy_CLI_Overview.pdf).
 
+Flex Bayesian optimization supports participant-grouped nested cross-validation
+(`--cv-strategy grouped-kfold`), nested leave-one-subject-out validation, and the
+existing leave-one-dataset-out mode. See the [participant-grouped workflow](docs/source/user_guide/participant_grouped_optimization.rst)
+for preflight, pilot, full Ubuntu runs, separate final recipe selection, and Git
+preparation commands. Only Flex matrix decisions are searched; downstream cleaning
+remains fixed.
+
 **Key features**
 
 - Load EEG from EDF, GDF, and BIDS formats

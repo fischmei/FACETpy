@@ -1,0 +1,85 @@
+[
+  {
+    "method": "dense_matrix",
+    "wall_seconds": 0.050090541830286384,
+    "peak_rss_mb": 195.890625,
+    "block_inputs": 0,
+    "block_outputs": 0,
+    "logical_output_bytes": 0,
+    "calculations": {
+      "epochs": 800,
+      "epoch_samples": 256,
+      "matrix_bytes": 5120000,
+      "template_checksum": -190.47633213435978
+    },
+    "synthetic_input": {
+      "channels": 3,
+      "sfreq": 200,
+      "seconds": 40,
+      "repeated_folds": 3
+    }
+  },
+  {
+    "method": "sparse_matrix",
+    "wall_seconds": 0.049472833052277565,
+    "peak_rss_mb": 194.296875,
+    "block_inputs": 0,
+    "block_outputs": 0,
+    "logical_output_bytes": 0,
+    "calculations": {
+      "epochs": 800,
+      "epoch_samples": 256,
+      "matrix_bytes": 51204,
+      "template_checksum": -190.47633213435978
+    },
+    "synthetic_input": {
+      "channels": 3,
+      "sfreq": 200,
+      "seconds": 40,
+      "repeated_folds": 3
+    }
+  },
+  {
+    "method": "original_lifecycle",
+    "wall_seconds": 0.4728363750036806,
+    "peak_rss_mb": 193.421875,
+    "block_inputs": 0,
+    "block_outputs": 0,
+    "logical_output_bytes": 758400,
+    "calculations": {
+      "original_psds": 45,
+      "trigger_detections": 15,
+      "upsampled_channels": 45,
+      "corrected_channels": 45
+    },
+    "synthetic_input": {
+      "channels": 3,
+      "sfreq": 200,
+      "seconds": 40,
+      "repeated_folds": 3
+    }
+  },
+  {
+    "method": "prepared_metrics",
+    "wall_seconds": 0.28033266589045525,
+    "peak_rss_mb": 192.5,
+    "block_inputs": 0,
+    "block_outputs": 0,
+    "logical_output_bytes": 5183392,
+    "calculations": {
+      "original_psds": 3,
+      "trigger_detections": 0,
+      "upsampled_channels": 3,
+      "corrected_channels": 15,
+      "dataset_metric_cache_hits": 10,
+      "unique_configurations": 5,
+      "note": "Triggers supplied from the common synthetic fixture; preflight adds one detection per session."
+    },
+    "synthetic_input": {
+      "channels": 3,
+      "sfreq": 200,
+      "seconds": 40,
+      "repeated_folds": 3
+    }
+  }
+]

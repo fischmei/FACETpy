@@ -1,0 +1,439 @@
+{
+  "identity": "2e7e55883e49e138223f64bba05f8c6106a63e5b5ffeab55da762e3758e53883",
+  "passed": true,
+  "dataset_id": "sub-01_ses-01_task-checker_eeg",
+  "baseline_matrix": {
+    "quota": {
+      "window_size": 10,
+      "past": 0,
+      "future": 10,
+      "global_mode": false
+    },
+    "sampling": {
+      "mode": "consecutive",
+      "stride": 1,
+      "start_offset": 1
+    },
+    "motion": {
+      "same_motion_segment": false,
+      "motion_stable_only": false,
+      "max_motion_distance": null
+    },
+    "target_policy": "exclude_target",
+    "scoring": {
+      "mode": "signed_pearson",
+      "threshold": 0.975,
+      "temporal_weight": null,
+      "motion_weight": null,
+      "temporal_unit": null
+    },
+    "template_size": {
+      "mode": "minimum_k",
+      "k": 5
+    },
+    "weighting": {
+      "kernel": "equal",
+      "basis": null,
+      "temporal_unit": null,
+      "sigma": null,
+      "scale": null,
+      "degrees_of_freedom": null
+    }
+  },
+  "variant_matrix": {
+    "quota": {
+      "window_size": 20,
+      "past": 10,
+      "future": 10,
+      "global_mode": false
+    },
+    "sampling": {
+      "mode": "consecutive",
+      "stride": 1,
+      "start_offset": 1
+    },
+    "motion": {
+      "same_motion_segment": false,
+      "motion_stable_only": false,
+      "max_motion_distance": null
+    },
+    "target_policy": "exclude_target",
+    "scoring": {
+      "mode": "signed_pearson",
+      "threshold": 0.975,
+      "temporal_weight": null,
+      "motion_weight": null,
+      "temporal_unit": null
+    },
+    "template_size": {
+      "mode": "minimum_k",
+      "k": 5
+    },
+    "weighting": {
+      "kernel": "equal",
+      "basis": null,
+      "temporal_unit": null,
+      "sigma": null,
+      "scale": null,
+      "degrees_of_freedom": null
+    }
+  },
+  "baseline_metrics": {
+    "alpha_clean_coverage": 0.9924962959422644,
+    "alpha_power_change_db": 0.4934022899629493,
+    "alpha_preservation": 1.1270099733625365,
+    "clean_band_coverage_sufficient": 1.0,
+    "finite_sample_fraction": 1.0,
+    "non_trigger_locked_rms": 3.1895177381695905e-05,
+    "nonpeak_beta_clean_coverage": 0.9771571969713746,
+    "nonpeak_beta_power_change_db": 0.20472177794802127,
+    "nonpeak_beta_preservation": 1.0777711602431084,
+    "nonpeak_eeg_log_deviation": 0.1286124290384383,
+    "original_signal_rms": 0.0017050474426884257,
+    "reference_alpha_bandpower_log_deviation": 0.9058005698384262,
+    "reference_channel_coverage": 0.983606557377049,
+    "reference_correlation": 0.26972064988523337,
+    "reference_median_residual": 9.78976960711982e-06,
+    "reference_metric_valid": 1.0,
+    "reference_nonpeak_beta_bandpower_log_deviation": 0.9070562425169626,
+    "reference_normalized_mse": 6.059787867202685,
+    "reference_rms_residual": 1.678956481451088e-05,
+    "reference_snr_db": -7.208589033507575,
+    "reference_spectral_log_deviation": 1.331550456431277,
+    "reference_spectral_similarity": 0.5805716084945024,
+    "reference_stimulus_12hz_bandpower_log_deviation": 0.9026660904959282,
+    "reference_stimulus_24hz_bandpower_log_deviation": 0.798979004281953,
+    "reference_theta_bandpower_log_deviation": 1.066129342250022,
+    "reference_timeline_coverage": 0.8974635278514588,
+    "reference_valid_seconds": 186.95199999999997,
+    "scanner_artifact_residual_power": 4.2704827920470623e-11,
+    "scanner_peak_count": 75.40816326530613,
+    "scanner_peak_residual": 0.0007617795438487233,
+    "scanner_suppression_db": 41.33175507834102,
+    "signal_peak_to_peak": 0.0014920356313107253,
+    "signal_rms": 7.634219677269485e-05,
+    "theta_clean_coverage": 0.9851570877776998,
+    "theta_power_change_db": 0.5359740702196524,
+    "theta_preservation": 1.1332977082548157,
+    "trigger_locked_power_ratio": 0.003556988019238276,
+    "trigger_locked_rms": 6.455958995648995e-05,
+    "reference_evaluated_seconds": 205.8,
+    "reference_evaluation_coverage": 0.9084159378036927,
+    "n_chunks": 7,
+    "successful_chunks": 7,
+    "n_channels": 61,
+    "reference_available": true,
+    "success": true
+  },
+  "variant_screening_metrics": {
+    "alpha_clean_coverage": 0.9920516641828115,
+    "alpha_power_change_db": 0.4034191498600545,
+    "alpha_preservation": 1.1036223370454132,
+    "clean_band_coverage_sufficient": 1.0,
+    "finite_sample_fraction": 1.0,
+    "non_trigger_locked_rms": 3.64707046501114e-05,
+    "nonpeak_beta_clean_coverage": 0.9766114411165334,
+    "nonpeak_beta_power_change_db": -0.08716649183036991,
+    "nonpeak_beta_preservation": 1.0027510304337206,
+    "nonpeak_eeg_log_deviation": 0.09730655903092185,
+    "original_signal_rms": 0.0017046516826528643,
+    "reference_alpha_bandpower_log_deviation": 0.7975935556469862,
+    "reference_channel_coverage": 0.983606557377049,
+    "reference_correlation": 0.30115437602062395,
+    "reference_median_residual": 9.447452979364933e-06,
+    "reference_metric_valid": 1.0,
+    "reference_nonpeak_beta_bandpower_log_deviation": 0.791830728633056,
+    "reference_normalized_mse": 5.272852322913894,
+    "reference_rms_residual": 1.601074713711595e-05,
+    "reference_snr_db": -6.739834420551023,
+    "reference_spectral_log_deviation": 1.1545732749112363,
+    "reference_spectral_similarity": 0.6089716813679439,
+    "reference_stimulus_12hz_bandpower_log_deviation": 0.7152167061154551,
+    "reference_stimulus_24hz_bandpower_log_deviation": 0.7152038694085086,
+    "reference_theta_bandpower_log_deviation": 1.0495759527443804,
+    "reference_timeline_coverage": 0.8974635278514588,
+    "reference_valid_seconds": 79.272,
+    "scanner_artifact_residual_power": 2.850143463300309e-11,
+    "scanner_peak_count": 75.46887538690818,
+    "scanner_peak_residual": 0.0006762071380107517,
+    "scanner_suppression_db": 42.80417591917947,
+    "signal_peak_to_peak": 0.0028483790841191997,
+    "signal_rms": 7.736599242863462e-05,
+    "theta_clean_coverage": 0.9855583034398886,
+    "theta_power_change_db": 0.34396368974917507,
+    "theta_preservation": 1.084060456231267,
+    "trigger_locked_power_ratio": 0.003349697538568598,
+    "trigger_locked_rms": 6.192016437993305e-05,
+    "reference_evaluated_seconds": 85.8,
+    "reference_evaluation_coverage": 0.923916083916084,
+    "n_chunks": 3,
+    "successful_chunks": 3,
+    "n_channels": 61,
+    "reference_available": true,
+    "success": true
+  },
+  "baseline_screening_metrics": {
+    "alpha_clean_coverage": 0.9920516641828115,
+    "alpha_power_change_db": 0.5573854396097437,
+    "alpha_preservation": 1.1496993121526298,
+    "clean_band_coverage_sufficient": 1.0,
+    "finite_sample_fraction": 1.0,
+    "non_trigger_locked_rms": 3.639118859170694e-05,
+    "nonpeak_beta_clean_coverage": 0.9766114411165334,
+    "nonpeak_beta_power_change_db": 0.1551600537101448,
+    "nonpeak_beta_preservation": 1.0715463906908942,
+    "nonpeak_eeg_log_deviation": 0.13014726774800217,
+    "original_signal_rms": 0.0017046516826528643,
+    "reference_alpha_bandpower_log_deviation": 0.8775703703618746,
+    "reference_channel_coverage": 0.983606557377049,
+    "reference_correlation": 0.2652233715405644,
+    "reference_median_residual": 1.0010157078523244e-05,
+    "reference_metric_valid": 1.0,
+    "reference_nonpeak_beta_bandpower_log_deviation": 0.8716731245895202,
+    "reference_normalized_mse": 5.9404499493277525,
+    "reference_rms_residual": 1.6873449835089794e-05,
+    "reference_snr_db": -7.214902578310309,
+    "reference_spectral_log_deviation": 1.2546523522084707,
+    "reference_spectral_similarity": 0.5956941738758792,
+    "reference_stimulus_12hz_bandpower_log_deviation": 0.9152321256335787,
+    "reference_stimulus_24hz_bandpower_log_deviation": 0.8448650143479652,
+    "reference_theta_bandpower_log_deviation": 1.0662085451244776,
+    "reference_timeline_coverage": 0.8974635278514588,
+    "reference_valid_seconds": 79.27199999999999,
+    "scanner_artifact_residual_power": 2.937986857724873e-11,
+    "scanner_peak_count": 75.46887538690818,
+    "scanner_peak_residual": 0.0006675432636932832,
+    "scanner_suppression_db": 41.80536053126647,
+    "signal_peak_to_peak": 0.0028481428335567936,
+    "signal_rms": 7.826999908545741e-05,
+    "theta_clean_coverage": 0.9855583034398886,
+    "theta_power_change_db": 0.4721119627994778,
+    "theta_preservation": 1.117003771662778,
+    "trigger_locked_power_ratio": 0.003449066543845746,
+    "trigger_locked_rms": 6.264696755984126e-05,
+    "reference_evaluated_seconds": 85.8,
+    "reference_evaluation_coverage": 0.9239160839160838,
+    "n_chunks": 3,
+    "successful_chunks": 3,
+    "n_channels": 61,
+    "reference_available": true,
+    "success": true
+  },
+  "flex_checkpoint_changed": true,
+  "fixed_preprocessing": {
+    "version": 2,
+    "parameters": {
+      "sfreq": 200.0,
+      "l_freq": 1.0,
+      "h_freq": 70.0,
+      "pca_components": 0.95,
+      "pca_hp_freq": null,
+      "bcg_window": 10,
+      "bcg_threshold": 0.975,
+      "qrs_l_freq": 1.0,
+      "qrs_h_freq": 40.0
+    },
+    "ecg_scanner_matrix": "Reuse the first good EEG channel's candidate scanner matrix; never score cardiac similarity",
+    "qrs_detection_interval": "First MRI trigger through last complete artifact window; exclude pre-acquisition padding; restore event indices to original timeline",
+    "order": [
+      "pca_correction",
+      "ecg_detection_bandpass",
+      "qrs_detection",
+      "heartbeat_aas",
+      "resample",
+      "bandpass",
+      "exclude_marked_bad_channels",
+      "average_reference"
+    ],
+    "anc": {
+      "enabled": false,
+      "reason": "No validated retained ANC noise reference"
+    },
+    "asr": {
+      "enabled": false,
+      "reason": "No FACETpy automated ASR processor"
+    },
+    "ica": {
+      "enabled": false,
+      "reason": "No FACETpy ICA rejection processor"
+    },
+    "bad_segments": "Preserve timeline; exclude existing BAD annotations during comparison",
+    "bad_channels": "Honor existing marks; no new automatic detection or interpolation",
+    "reference_convention": "Average over each recording's good EEG; compare on shared good EEG",
+    "chunking": "Run on padded chunks; score cores only; not equivalent to whole-record filtering"
+  },
+  "alignment": {
+    "channels": [
+      "Fp1",
+      "Fp2",
+      "F3",
+      "F4",
+      "C3",
+      "C4",
+      "P3",
+      "P4",
+      "O1",
+      "O2",
+      "F7",
+      "F8",
+      "T7",
+      "T8",
+      "P7",
+      "P8",
+      "Fz",
+      "Cz",
+      "Pz",
+      "Oz",
+      "FC1",
+      "FC2",
+      "CP1",
+      "CP2",
+      "FC5",
+      "FC6",
+      "CP5",
+      "CP6",
+      "TP9",
+      "TP10",
+      "POz",
+      "F1",
+      "F2",
+      "C1",
+      "C2",
+      "P1",
+      "P2",
+      "AF3",
+      "AF4",
+      "FC3",
+      "CP3",
+      "CP4",
+      "PO3",
+      "PO4",
+      "F5",
+      "F6",
+      "C5",
+      "C6",
+      "P5",
+      "P6",
+      "AF7",
+      "AF8",
+      "FT7",
+      "FT8",
+      "TP7",
+      "TP8",
+      "PO7",
+      "PO8",
+      "Fpz",
+      "CPz"
+    ],
+    "missing_reference_channels": [
+      "FC4"
+    ],
+    "reference_only_channels": [],
+    "intervals": [
+      {
+        "raw_start": 1.34,
+        "reference_start": 0.0,
+        "duration": 17.476
+      },
+      {
+        "raw_start": 19.556,
+        "reference_start": 17.476,
+        "duration": 0.004
+      },
+      {
+        "raw_start": 20.364,
+        "reference_start": 17.48,
+        "duration": 5.552
+      },
+      {
+        "raw_start": 31.772,
+        "reference_start": 23.032,
+        "duration": 126.248
+      },
+      {
+        "raw_start": 160.416,
+        "reference_start": 149.28,
+        "duration": 10.56
+      },
+      {
+        "raw_start": 172.656,
+        "reference_start": 159.84,
+        "duration": 11.58
+      },
+      {
+        "raw_start": 186.256,
+        "reference_start": 171.42,
+        "duration": 4.44
+      },
+      {
+        "raw_start": 192.036,
+        "reference_start": 175.86,
+        "duration": 6.552
+      },
+      {
+        "raw_start": 199.396,
+        "reference_start": 182.412,
+        "duration": 5.028
+      },
+      {
+        "raw_start": 205.764,
+        "reference_start": 187.44,
+        "duration": 1.72
+      },
+      {
+        "raw_start": 208.484,
+        "reference_start": 189.16,
+        "duration": 3.42
+      },
+      {
+        "raw_start": 213.244,
+        "reference_start": 192.58,
+        "duration": 6.48
+      },
+      {
+        "raw_start": 221.064,
+        "reference_start": 199.06,
+        "duration": 13.28
+      },
+      {
+        "raw_start": 236.024,
+        "reference_start": 212.34,
+        "duration": 0.7
+      },
+      {
+        "raw_start": 237.78,
+        "reference_start": 213.04,
+        "duration": 3.5
+      }
+    ],
+    "provenance": {
+      "method": "Published EEG.etc.clean_sample_mask and original bvmknum/urevent timestamps",
+      "matched_events": 491,
+      "maximum_event_error_seconds": 2.842170943040401e-14,
+      "maximum_mapped_event_error_seconds": 0.004,
+      "fractional_events_adjacent_to_rejection": 1,
+      "reference_history": "\nEEG.etc.eeglabvers = '14.1.2'; % this tracks which version of EEGLAB is being used, you may ignore it\nEEG.etc.eeglabvers = '2021.0'; % this tracks which version of EEGLAB is being used, you may ignore it\nEEG.setname='Checkerboard (12Hz): Scanner ON | GA Removed (ANC)';\nEEG.setname='Checkerboard (12Hz): Scanner ON | GA Removed (ANC) | QRS Detection';\nEEG.setname='Checkerboard (12Hz): Scanner ON | GA Removed (ANC) | QRS Detection | PA Removal (Median)';\nEEG.setname='Checkerboard (12Hz): Scanner ON | GA Removed (ANC) | QRS Detection | PA Removal (Median) | FIR Filter 0.5-70Hz';\nEEG.etc.eeglabvers = '2022.0'; % this tracks which version of EEGLAB is being used, you may ignore it\nEEG = eeg_checkset( EEG );\nEEG.etc.eeglabvers = '2021.1'; % this tracks which version of EEGLAB is being used, you may ignore it",
+      "reference_setname": "Checkerboard (12Hz): Scanner ON | GA Removed (ANC) | QRS Detection | PA Removal (Median) | FIR Filter 0.5-70Hz resampled pruned with ICA"
+    },
+    "coverage": 0.8974635278514589,
+    "reference_sfreq": 250.0,
+    "reference_highpass": 0.0,
+    "reference_lowpass": 125.0,
+    "harmonization": "Explicit resampling to least common integer rate (max 2000 Hz) for sample-exact metadata alignment; average reference on shared good EEG; volts"
+  },
+  "execution_seconds": 61.506816166918725,
+  "process_peak_rss_mb": 2464.015625,
+  "interpretation": "Reference is a published comparison output, not neural ground truth. Execution gate only; no reference threshold selects or tunes the recipe.",
+  "software": {
+    "packages": {
+      "facetpy": "2.0.2",
+      "mne": "1.10.2",
+      "numpy": "2.1.3",
+      "optuna": "4.9.0",
+      "scipy": "1.17.1"
+    },
+    "python": "3.12.16",
+    "source_hash": "2389a7bb84a4acf4d060680a52f844934a8320f37271355c15226726ea7d1cbb"
+  },
+  "command": "uv run facet-optimize data/natview/raw output/natview_validation --reference-directory data/natview/cleaned --evaluation-mode combined --recursive --include-pattern sub-01_ses-01_task-checker_eeg.set --validate-only --upsample-factor 1 --chunk-seconds 30 --chunk-min-triggers 10 --chunk-padding-seconds 5 --memory-mb 6000"
+}

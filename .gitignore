@@ -92,6 +92,14 @@ ENV/
 legacy/
 logs/
 output/
+/data/
+/results/
+/optimization_results/
+**/prepared/
+**/evaluation_cache.sqlite3*
+**/screening_study.sqlite3*
+**/sampler_state.pkl
+**/comparison_preview.npz
 export/
 ai-docs/
 quick-notes/

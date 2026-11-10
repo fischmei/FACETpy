@@ -1327,6 +1327,46 @@ class AveragingMatrixBuilder:
         self._validate_matrix(matrix)
         return matrix
 
+    def build_sparse(self, epochs: np.ndarray, metadata: MatrixMetadata | None = None):
+        """Build CSR weights with the same candidate, selection and kernel rules.
+
+        Memory grows with selected candidates rather than n_epochs squared.
+        The dense public method remains unchanged for existing processors.
+        """
+        from scipy.sparse import csr_matrix
+
+        epochs = np.asarray(epochs, dtype=float)
+        if epochs.ndim != 2:
+            raise MatrixDecisionError("epochs must have shape (n_epochs, n_samples)")
+        metadata = MatrixMetadata() if metadata is None else metadata
+        if not isinstance(metadata, MatrixMetadata):
+            raise MatrixDecisionError("metadata must be MatrixMetadata")
+        count = len(epochs)
+        motion = self._validate_and_resolve_metadata(metadata, count)
+        indices, weights, indptr = [], [], [0]
+        for target in range(count):
+            candidates = self._candidate_pool(
+                target_idx=target, n_epochs=count, metadata=metadata, motion=motion,
+            )
+            selected = self._selected_candidates(
+                epochs=epochs, target_idx=target, candidate_indices=candidates,
+                metadata=metadata, motion=motion,
+            )
+            if selected.size:
+                values = self._normalized_weights(
+                    target_idx=target, selected_indices=selected, metadata=metadata, motion=motion,
+                )
+                indices.extend(selected.tolist())
+                weights.extend(values.tolist())
+            indptr.append(len(indices))
+        matrix = csr_matrix((weights, indices, indptr), shape=(count, count), dtype=float)
+        matrix.sort_indices()
+        sums = np.asarray(matrix.sum(axis=1)).ravel()
+        if (not np.all(np.isfinite(matrix.data)) or np.any(matrix.data < 0)
+                or np.any((np.diff(matrix.indptr) > 0) & ~np.isclose(sums, 1, rtol=1e-10, atol=1e-12))):
+            raise MatrixDecisionError("invalid sparse averaging weights")
+        return matrix
+
     def candidate_pool(
         self,
         *,

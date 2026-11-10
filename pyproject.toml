@@ -82,6 +82,7 @@ module-root = "src"
 [project.scripts]
 build-fastranc = "facet.build:compile_fastranc"
 facetpy-run = "facet.cli:main"
+facet-optimize = "facet.optimization.search:main"
 facetpy-to-bids = "facet.cli:bids_main"
 facetpy-convert-bids = "facet._cli_convert_bids:convert_bids_main"
 
