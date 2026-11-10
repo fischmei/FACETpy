@@ -35,6 +35,11 @@ class TriggerDetector(Processor):
     volume-level gaps in slice-triggered acquisitions are detected
     automatically.
 
+    Events at the exact same sample are deduplicated before timing inference;
+    distinct samples are retained without reordering. Internal boundary
+    annotations require splitting the recording into continuous segments first.
+    A boundary at the recording start or end does not join discontinuous data.
+
     Parameters
     ----------
     regex : str
@@ -46,7 +51,7 @@ class TriggerDetector(Processor):
 
     name = "trigger_detector"
     description = "Detect triggers using regex pattern"
-    version = "1.0.0"
+    version = "1.0.1"
 
     requires_triggers = False
     requires_raw = True
@@ -73,13 +78,8 @@ class TriggerDetector(Processor):
             logger.warning("No triggers found!")
             return context
 
-        triggers = np.array([event[0] for event in filtered_events])
-        # MNE returns absolute sample indices (onset * sfreq + first_samp).
-        # Normalize to 0-indexed positions relative to the current raw start
-        # so that triggers can be used directly as indices into raw._data.
-        triggers = triggers - raw.first_samp
-        logger.info("Found {} triggers", len(triggers))
-
+        triggers = self._prepare_trigger_samples(raw, filtered_events)
+        self._validate_acquisition_boundaries(raw)
         artifact_meta = self._compute_artifact_metadata(triggers)
 
         # --- BUILD RESULT ---
@@ -116,6 +116,46 @@ class TriggerDetector(Processor):
             new_metadata,
             copy_estimated_noise=False,
         )
+
+    @staticmethod
+    def _prepare_trigger_samples(raw: mne.io.Raw, events: list) -> np.ndarray:
+        """Normalize absolute MNE samples and remove exact duplicates in order."""
+        triggers = np.asarray([event[0] for event in events]) - raw.first_samp
+        original_count = len(triggers)
+        _, first_indices = np.unique(triggers, return_index=True)
+        # np.unique sorts values by default. Preserve first-occurrence order
+        # instead, so deduplication cannot hide an invalid reversed sequence.
+        triggers = triggers[np.sort(first_indices)]
+        logger.info(
+            "Scanner triggers: original={}, duplicates_removed={}, final={}",
+            original_count,
+            original_count - len(triggers),
+            len(triggers),
+        )
+        if (
+            not np.all(np.isfinite(triggers))
+            or np.any(triggers < 0)
+            or np.any(triggers >= raw.n_times)
+            or np.any(np.diff(triggers) <= 0)
+        ):
+            raise ProcessorValidationError(
+                "Scanner triggers must be finite, in bounds, and strictly increasing after exact-sample deduplication."
+            )
+        return triggers
+
+    @staticmethod
+    def _validate_acquisition_boundaries(raw: mne.io.Raw) -> None:
+        """Reject internal discontinuities, retaining harmless edge markers."""
+        for onset, description in zip(raw.annotations.onset, raw.annotations.description, strict=True):
+            if str(description).strip().casefold() not in {"boundary", "bad boundary", "edge boundary"}:
+                continue
+            sample = int(round((float(onset) - raw.first_time) * raw.info["sfreq"]))
+            if 0 < sample < raw.n_times:
+                raise ProcessorValidationError(
+                    f"Internal boundary annotation at sample {sample}: scanner timing cannot be inferred "
+                    "across discontinuous data. Split the recording into continuous segments before "
+                    "trigger detection or optimization preflight."
+                )
 
     def _find_events(self, raw: mne.io.Raw) -> list:
         """Search stim channels then annotations for matching events.
