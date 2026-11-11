@@ -1237,7 +1237,7 @@ def aggregate_chunk_results(chunked_result: Any) -> dict[str, Any]:
     }
 
 
-from facet.optimization.cache import EvaluationCache, digest, file_identity  # noqa: E402
+from facet.optimization.cache import EvaluationCache, digest  # noqa: E402
 from facet.optimization.prepared import evaluate_prepared, prepare_dataset, worker_limit  # noqa: E402
 
 
@@ -1958,6 +1958,18 @@ def plot_held_out_metrics(frame: pd.DataFrame, path: Path) -> None:
 
 
 def _validate_arguments(args: argparse.Namespace) -> None:
+    if args.exclude_invalid_references and args.evaluation_mode == "non-reference":
+        raise ValueError("--exclude-invalid-references requires reference or combined evaluation mode.")
+    if (
+        args.exclude_invalid_references
+        and args.cv_strategy == "leave-one-dataset-out"
+        and not args.validate_only
+        and not args.preflight_only
+    ):
+        raise ValueError(
+            "Optimization with --exclude-invalid-references requires participant-grouped CV: "
+            "use --cv-strategy grouped-kfold or leave-one-subject-out."
+        )
     if args.outer_folds < 2 or args.inner_folds < 2 or args.cv_seed < 0:
         raise ValueError("CV fold counts must be at least two and --cv-seed must be nonnegative.")
     if args.outer_fold_index is not None and args.outer_fold_index < 0:
@@ -2038,6 +2050,11 @@ def build_argument_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--assume-reference-aligned", action="store_true")
     parser.add_argument(
+        "--exclude-invalid-references",
+        action="store_true",
+        help="Audit every raw/reference pair and exclude invalid sessions before CV; strict failure is the default.",
+    )
+    parser.add_argument(
         "--validate-only",
         action="store_true",
         help="Validate one raw/reference pair and fixed cleaning without running Optuna.",
@@ -2114,7 +2131,12 @@ def main(argv: Sequence[str] | None = None) -> int:
     discovered = [path for path in discovered if not any(path.resolve().is_relative_to(root) for root in exclusions)]
     if args.validate_only and len(discovered) != 1:
         raise ValueError("--validate-only requires an input directory containing exactly one recording.")
-    if not args.validate_only and not args.preflight_only and len(discovered) < 3:
+    if (
+        args.evaluation_mode == "non-reference"
+        and not args.validate_only
+        and not args.preflight_only
+        and len(discovered) < 3
+    ):
         raise ValueError("At least three original recordings are required after excluding reference/output folders.")
     paths = unique_dataset_ids(discovered)
     if not paths:
@@ -2124,12 +2146,6 @@ def main(argv: Sequence[str] | None = None) -> int:
 
         for path in paths.values():
             subject_id(path)
-    datasets = preflight_datasets(
-        paths,
-        trigger_regex=args.trigger_regex,
-        motion_directory=args.motion_directory,
-        rotation_scale=args.rotation_scale,
-    )
     settings = RunSettings(
         trigger_regex=args.trigger_regex,
         upsample_factor=args.upsample_factor,
@@ -2153,36 +2169,51 @@ def main(argv: Sequence[str] | None = None) -> int:
         evaluation_mode=args.evaluation_mode,
         assume_reference_aligned=args.assume_reference_aligned,
     )
-    from facet.optimization.prepared import match_reference
-    from facet.optimization.reference import alignment_path
+    from facet.optimization.eligibility import pair_recording, preflight_reference_sessions
 
-    for identifier, dataset in list(datasets.items()):
-        reference = match_reference(dataset, args.reference_directory, args.input_directory, args.recursive)
-        if reference is None and args.evaluation_mode != "non-reference":
-            raise ValueError(f"Missing separately cleaned reference for {identifier}.")
-        if reference is not None and reference.resolve() == dataset.path.resolve():
-            raise ValueError(f"Reference and original must be separate recordings: {identifier}.")
-        datasets[identifier] = replace(
-            dataset,
-            reference_path=reference,
-            input_identity=file_identity(dataset.path),
-            reference_identity=file_identity(reference) if reference is not None else None,
-            alignment_identity=file_identity(alignment_path(reference))
-            if reference is not None and alignment_path(reference).exists()
-            else None,
+    eligibility = None
+    if settings.evaluation_mode != "non-reference":
+        datasets, eligibility = preflight_reference_sessions(paths, settings, args)
+        if (
+            args.cv_strategy == "leave-one-dataset-out"
+            and not args.validate_only
+            and not args.preflight_only
+            and len(datasets) < 3
+        ):
+            raise ValueError(
+                "At least three eligible recordings are required after reference validation; "
+                "see reference_eligibility.csv."
+            )
+    else:
+        datasets = preflight_datasets(
+            paths,
+            trigger_regex=args.trigger_regex,
+            motion_directory=args.motion_directory,
+            rotation_scale=args.rotation_scale,
         )
+        datasets = {identifier: pair_recording(dataset, args) for identifier, dataset in datasets.items()}
     from facet.optimization.cv import build_plan, subject_id
 
     cv_plan = None
     if args.cv_strategy != "leave-one-dataset-out":
         datasets = {key: replace(value, participant_id=subject_id(value.path)) for key, value in datasets.items()}
-        cv_plan = build_plan(
-            list(datasets.values()),
-            strategy=args.cv_strategy,
-            outer_folds=args.outer_folds,
-            inner_folds=args.inner_folds,
-            seed=args.cv_seed,
-        )
+        try:
+            cv_plan = build_plan(
+                list(datasets.values()),
+                strategy=args.cv_strategy,
+                outer_folds=args.outer_folds,
+                inner_folds=args.inner_folds,
+                seed=args.cv_seed,
+            )
+        except ValueError as exc:
+            if eligibility is None:
+                raise
+            raise ValueError(
+                f"Eligible cohort cannot support requested CV "
+                f"({eligibility['summary']['n_eligible_sessions']} sessions, "
+                f"{eligibility['summary']['n_eligible_participants']} participants): {exc}. "
+                "See reference_eligibility.csv."
+            ) from exc
         settings = replace(settings, cv_signature=cv_plan)
         if args.outer_fold_index is not None and args.outer_fold_index >= len(cv_plan["folds"]):
             raise ValueError(f"--outer-fold-index must be between 0 and {len(cv_plan['folds']) - 1}.")
@@ -2199,7 +2230,14 @@ def main(argv: Sequence[str] | None = None) -> int:
     if args.preflight_only:
         from facet.optimization.grouped import preflight_report
 
-        preflight_report(list(datasets.values()), settings, cv_plan, args.output_directory)
+        validated_rows = (
+            None
+            if eligibility is None
+            else {row["dataset_id"]: row for row in eligibility["sessions"] if row["eligible"]}
+        )
+        preflight_report(
+            list(datasets.values()), settings, cv_plan, args.output_directory, validated_rows=validated_rows
+        )
         return 0
     global OBJECTIVE_COLUMNS
     if args.evaluation_mode == "reference":
@@ -2235,6 +2273,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             {
                 "signature": run_signature,
                 "evaluation_signature": evaluation_signature,
+                "reference_eligibility": None if eligibility is None else eligibility["summary"],
                 **signature_payload,
             },
         )

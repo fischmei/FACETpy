@@ -28,8 +28,12 @@ For references, add:
    --reference-directory /path/to/separately_cleaned \
    --evaluation-mode combined
 
-Reference and combined modes require a matching, validated reference for every
-recording. There is no silent fallback. References match relative input paths,
+By default, reference and combined modes require a matching, validated reference
+for every recording. All sessions are audited in ``reference_eligibility.csv``
+before strict failure. Explicit ``--exclude-invalid-references`` instead retains
+valid sessions and rebuilds CV on that cohort; see
+:doc:`participant_grouped_optimization`. There is no silent fallback.
+References match relative input paths,
 then unique BIDS acquisition entities (subject, session, task, run, acquisition)
 across supported formats; preprocessing suffixes may differ. Channel names must
 match exactly and EEG must be in SI volts after loading. Missing channels are
@@ -103,6 +107,38 @@ timestamps against the raw file. It reports matched-event count and maximum
 timestamp error. Compacted event latencies are checked within one reference
 sample, allowing fractional events adjacent to rejection boundaries; the binary
 sample map itself is exact. This is metadata recovery, not a fitted EEG correlation lag.
+
+The published mask can describe an intermediate rejection stage. When its
+retained count exceeds final EEG length, FACETpy requires final boundary cuts
+and retained-event ``urevent`` origins to establish each continuous segment.
+Short unanchored segments require uniquely consistent boundary durations and
+mask constraints. Boundary durations are not blindly summed: a later boundary
+may count deletion from an already compacted intermediate recording. The final
+map must be an ordered subset of the original mask, contain exactly the final
+EEG sample count, and agree independently with original marker IDs/timestamps.
+Missing or ambiguous segment origins, incompatible clocks, or contradictory
+durations fail with a provenance diagnostic. No EEG correlation alignment,
+length-only truncation, interpolation, shift or stretch repairs a failed map.
+The cleaning stage responsible cannot be inferred from sample counts alone.
+
+To inspect a server recording without loading EEG signals or creating files:
+
+.. code-block:: bash
+
+   uv run python -m facet.optimization.eeglab_diagnostic \
+       /path/to/raw/sub-02_ses-01_task-rest_eeg.set \
+       /path/to/cleaned/sub-02_ses-01_task-rest_eeg.set
+
+The CLI reads explicitly selected MAT metadata variables (including ``etc``
+for the sample mask), excluding ``data`` and signal/ICA activation arrays.
+It prints mask counts, boundaries, per-segment urevent origin ranges, original
+event clock checks, mapping examples, history and verification/blocking evidence
+to stdout. ``--max-events 0`` prints every mapping; ``--json`` prints the complete
+structured report. Exit status 2 means provenance is blocked/unsupported;
+nested SET structures are not loaded because they may contain signal arrays.
+Successful reconstruction on synthetic or other recordings does not establish
+the timeline of an uninspected recording: review that recording's diagnostic
+before using its reference metrics.
 
 Otherwise, removed samples require ``<reference filename>.alignment.json``:
 

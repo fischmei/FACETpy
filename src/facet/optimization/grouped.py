@@ -15,7 +15,7 @@ from facet.optimization.inner_cv import InnerValidation
 from facet.optimization.reference import reference_plan
 
 
-def preflight_report(datasets, settings, plan, root):
+def preflight_report(datasets, settings, plan, root, validated_rows=None):
     """Inspect acquisition/pairing metadata without correction, TPE or preparation."""
     from facet.optimization.search import _atomic_write_csv, write_json
 
@@ -28,7 +28,14 @@ def preflight_report(datasets, settings, plan, root):
             "reference": str(dataset.reference_path),
             "scanner_triggers": len(dataset.trigger_samples),
         }
-        if settings.evaluation_mode != "non-reference":
+        if settings.evaluation_mode != "non-reference" and validated_rows is not None:
+            row.update(
+                {
+                    name: validated_rows[dataset.dataset_id][name]
+                    for name in ("shared_channels", "reference_coverage", "raw_sfreq", "reference_sfreq")
+                }
+            )
+        elif settings.evaluation_mode != "non-reference":
             raw = Loader(str(dataset.path), preload=False).execute(None).get_raw()
             reference = None
             try:

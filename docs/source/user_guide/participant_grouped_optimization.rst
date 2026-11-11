@@ -45,6 +45,50 @@ Expanded/full promotion uses all validation sessions. No outer-test scores or
 reference comparisons rank trials, promote candidates or select recipes.
 The single-recording execution gate uses an outer-training recording.
 
+Optional technical session exclusion
+------------------------------------
+
+Reference/combined preflight checks every discovered raw/reference pair before
+constructing CV folds. Strict mode remains the default: any invalid session
+stops the run after the complete audit has been written. Add
+``--exclude-invalid-references`` to retain only technically valid sessions:
+
+.. code-block:: bash
+
+   uv run facet-optimize "$RAW" "$OUT" "${COMMON[@]}" \
+       --cv-strategy grouped-kfold --outer-folds 5 \
+       --exclude-invalid-references --preflight-only
+
+Use the flag on subsequent pilot, full-CV and final-only commands too; exclusions
+are never silently enabled by a previous report. This flag is available only
+in reference and combined modes. ``reference_eligibility.csv`` lists every
+session, participant/session IDs, raw/reference paths, validation status/stage,
+exception type and exact exclusion reason. ``reference_eligibility.json`` records
+the policy, complete audit, and final eligible session/participant counts;
+the run manifest also records the summary. Existing ``dataset_preflight.csv``
+continues to describe the retained cohort.
+
+Optimization with this flag requires ``grouped-kfold`` or
+``leave-one-subject-out`` to keep each participant's sessions together;
+single-recording validation and preflight-only audits need no fitting strategy.
+
+Validation reuses scanner-trigger checks, fixed-cleaning prerequisites, channel
+and voltage checks, provenance-based time alignment and supported comparison
+sampling rates. It computes no Flex-dependent agreement score. Only failed
+sessions are excluded: participants keep all their other valid sessions. All
+folds are rebuilt using the eligible recordings, and requested outer/inner fold
+counts must still be supported. Participants with no valid sessions cannot
+enter the experiment. Audit files are written even if too few participants remain.
+
+Excluded recordings never enter preparation, trial evaluation, baselines, outer
+testing or final fitting. Input EEG/reference files are never edited, moved or
+deleted. Environment/allocation failures remain fatal rather than defining the
+cohort. Candidate-dependent correction failures remain evaluation failures;
+they do not trigger additional automatic session exclusions. Performance
+estimates therefore apply to the documented technically eligible cohort.
+If eligibility changes, use a new output directory: existing fold/study
+compatibility checks reject mixing different cohorts.
+
 Baselines and final recipe
 ----------------------------
 
