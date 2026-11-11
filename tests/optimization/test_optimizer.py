@@ -261,10 +261,10 @@ def test_bad_clean_coverage_stops_before_trials(recording, tmp_path, monkeypatch
     with pytest.raises(ValueError, match="Clean-band coverage preflight failed") as error:
         search.main([str(tmp_path), str(output), "--trigger-regex", "^R128$", "--upsample-factor", "2"])
     message = str(error.value)
-    for detail in ["sample", "chunk 0", "Cz", "theta: 0.0%", "alpha: 0.0%", "nonpeak_beta: 0.0%", "resolution="]:
+    for detail in ["sample", "theta: 0.0%", "alpha: 0.0%", "nonpeak_beta: 0.0%", "50%", "clean_band_coverage.csv"]:
         assert detail in message
     assert not list(output.rglob("prepared.json"))
-    assert not list(output.rglob("*_signal.npy"))
+    assert list(output.rglob("clean_band_coverage.csv"))
     assert not list(output.rglob("screening_study.sqlite3"))
 
 

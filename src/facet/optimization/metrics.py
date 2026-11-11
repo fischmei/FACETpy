@@ -10,7 +10,9 @@ import numpy as np
 from scipy.signal import welch
 
 BANDS = {"theta": (4, 8), "alpha": (8, 13), "nonpeak_beta": (13, 30)}
-METRIC_VERSION = 3
+METRIC_VERSION = 4
+MIN_CLEAN_BAND_COVERAGE = 0.25
+MIN_PRESERVATION_COVERAGE = 0.50
 
 
 def original_spectrum(data, sfreq, triggers, settings):
@@ -44,8 +46,8 @@ def original_spectrum(data, sfreq, triggers, settings):
     near_harmonic = (harmonic_number >= 1) & (np.abs(peaks - harmonic_number * fundamental) <= 2 * frequency_step)
     peaks = peaks[(peaks >= settings.scanner_peak_minimum_hz) | near_harmonic]
     # Cap the requested half-width at a quarter of the harmonic spacing, but
-    # retain two Welch bins for Hann leakage. Short, unresolved chunks are
-    # rejected by the clean-band preflight rather than narrowing below resolution.
+    # retain two Welch bins for Hann leakage. Unresolved measurements become
+    # unavailable rather than narrowing masks below resolution.
     width = max(min(settings.scanner_peak_half_width_hz, fundamental / 4), 2 * frequency_step)
     mask = np.zeros_like(frequencies, dtype=bool)
     for peak in peaks:
@@ -73,34 +75,35 @@ def clean_band_diagnostics(frequencies, original_psd, scanner_mask):
             "bins": int(clean.sum()),
             "power": denominator,
             "valid": (
-                coverage >= 0.25
+                coverage >= MIN_CLEAN_BAND_COVERAGE
                 and clean.sum() >= 2
                 and np.isfinite(denominator)
                 and denominator > np.finfo(float).tiny
             ),
         }
+        reasons = []
+        if coverage < MIN_CLEAN_BAND_COVERAGE:
+            reasons.append("clean frequency coverage below 25%")
+        if clean.sum() < 2:
+            reasons.append("fewer than two clean bins")
+        if not np.isfinite(denominator) or denominator <= np.finfo(float).tiny:
+            reasons.append("non-finite or non-positive original power")
+        diagnostics[name]["invalid_reason"] = "; ".join(reasons)
     return diagnostics
 
 
 def validate_clean_band_coverage(frequencies, original_psd, scanner_mask, *, context):
-    """Fail before optimization when preservation cannot be evaluated."""
-    diagnostics = clean_band_diagnostics(frequencies, original_psd, scanner_mask)
-    failures = [
-        f"{name}: {item['coverage']:.1%} clean, {item['bins']} bins, original power={item['power']:.3g}"
-        for name, item in diagnostics.items()
-        if not item["valid"]
-    ]
-    if failures:
-        raise ValueError(
-            f"Clean-band coverage preflight failed for {context}: {'; '.join(failures)}. "
-            f"Welch resolution={frequencies[1] - frequencies[0]:.4g} Hz. "
-            "Each band requires at least 25% clean coverage, two clean bins, and finite positive original power. "
-            "Inspect original spectra and trigger timing; increase --chunk-seconds for short chunks or "
-            "review scanner-peak settings against the original spectrum before running trials."
-        )
+    """Classify original-only support; isolated failures are unavailable.
+
+    Dataset/fidelity coverage is enforced after all measurements are classified.
+    ``context`` is retained for compatibility with existing callers.
+    """
+    return clean_band_diagnostics(frequencies, original_psd, scanner_mask)
 
 
-def spectral_metrics(corrected, sfreq, frequencies, original_psd, scanner_mask):
+def spectral_metrics(corrected, sfreq, frequencies, original_psd, scanner_mask, band_valid=None):
+    if not np.all(np.isfinite(corrected)):
+        raise ValueError("Candidate produced non-finite samples on the fixed evaluation set.")
     segment_samples = int(round(sfreq / (frequencies[1] - frequencies[0])))
     _, psd = welch(corrected, fs=sfreq, nperseg=segment_samples)
     tiny = np.finfo(float).tiny
@@ -117,12 +120,24 @@ def spectral_metrics(corrected, sfreq, frequencies, original_psd, scanner_mask):
     }
     deviations = []
     sufficient = True
-    for name, diagnostics in clean_band_diagnostics(frequencies, original_psd, scanner_mask).items():
+    diagnostics_by_band = clean_band_diagnostics(frequencies, original_psd, scanner_mask)
+    if band_valid is not None and not np.array_equal(
+        band_valid, [item["valid"] for item in diagnostics_by_band.values()]
+    ):
+        raise ValueError("Cached original preservation validity is inconsistent; rebuild preparation.")
+    for name, diagnostics in diagnostics_by_band.items():
         clean, denominator, valid = diagnostics["mask"], diagnostics["power"], diagnostics["valid"]
         result[f"{name}_clean_coverage"] = diagnostics["coverage"]
         ratio = power(psd, clean, frequencies) / denominator if valid else float("nan")
         result[f"{name}_preservation"] = ratio
         result[f"{name}_power_change_db"] = 10 * np.log10(max(ratio, tiny)) if valid else float("nan")
+        result[f"{name}_log_deviation"] = abs(np.log(max(ratio, tiny))) if valid else float("nan")
+        result[f"{name}_valid_measurements"] = int(valid)
+        result[f"{name}_invalid_measurements"] = int(not valid)
+        for metric in ("preservation", "power_change_db", "log_deviation"):
+            result[f"{name}_{metric}_weight"] = float(valid)
+        if valid and not np.isfinite(ratio):
+            raise ValueError(f"Candidate produced non-finite {name} power on the fixed evaluation set.")
         if valid:
             deviations.append(abs(np.log(max(ratio, tiny))))
         sufficient &= valid

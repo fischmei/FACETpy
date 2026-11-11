@@ -355,14 +355,48 @@ fixed contaminated bins. Theta, alpha and beta preservation use only clean bins,
 with log deviations, power changes and coverage reported. A band needs at least
 two clean bins and 25% clean coverage; otherwise preservation is unavailable.
 Preparation checks every channel and chunk before any optimization trials. If
-coverage or finite positive original band power is insufficient, it stops with
-the dataset, channel, chunk, affected bands and frequency resolution. Inspect
-original spectra and trigger timing; longer chunks can help resolve short
-recordings, and scanner-peak settings should be justified by the original EEG.
-Unavailable coverage is never replaced by a plausible score. After upgrading
-the spectral definition, use a new output directory or ``--rebuild-studies``
-when rerunning an existing output directory; prepared data and metric cache
-entries are invalidated automatically.
+coverage or finite positive original band power is insufficient, that measurement
+is unavailable (NaN), never zero. Preparation continues through the recording.
+The original PSD, contamination mask and band-validity flags are cached before
+correction; no corrected spectrum can add or remove eligible measurements.
+
+For each recording, **at least 50% of evaluated EEG channel-time must provide
+valid measurements in each of theta, alpha and beta**, independently at
+screening, expanded and full fidelity. Exactly 50% passes. This fixed majority
+policy prevents a small surviving channel/time subset from representing the
+recording; it is a conservative operational safeguard, not a statistical proof
+of sufficiency. A failed recording stops preparation after writing coverage
+reports, before any trials; automatic reference exclusion does not bypass this
+check. If only a screening subset fails, review its fixed channel/section counts.
+Coverage is never selected using reference agreement, candidate scores or
+held-out performance.
+
+``prepared/<fingerprint>/clean_band_coverage.csv`` reports dataset, chunk,
+channel, band, core duration, valid status/reason, clean-bin coverage and count,
+original power and Welch resolution. ``preservation_coverage.json`` and
+``prepared.json`` contain per-band/fidelity valid and invalid counts and
+channel-time coverage. The CSV/coverage JSON are written even when the overall
+requirement fails. Candidate result rows also include band-specific valid/invalid
+counts, measurement coverage and fixed weights in channel-seconds.
+
+Preservation ratios, dB changes and absolute log deviations use equal channel
+weights multiplied by core duration, restricted to the fixed eligible set for
+each band. Weight sums propagate through channel/chunk aggregation, so chunks
+with fewer valid channels cannot receive disproportionate weight. The
+non-reference preservation objective is the equal-band mean of these three
+weighted absolute log deviations. Existing session/participant/fold aggregation
+is unchanged. Non-finite candidate output or an unavailable value on an eligible
+measurement fails that evaluation; it cannot silently shrink the denominator.
+The same recording/fidelity therefore evaluates identical evidence for all
+recipes. Different fidelities are still separate experiments/cache entries.
+
+Inspect original spectra and trigger timing when support is insufficient.
+Longer configured chunks need not improve short trailing cores or the capped
+Welch segment resolution. Scanner-peak settings require justification from the
+original EEG. Estimates describe the available clean-frequency evidence and
+cannot establish preservation in the masked frequencies or rejected channel-time.
+After upgrading this metric definition, use a new output directory; prepared
+data and metric caches are versioned to prevent reuse of the old definition.
 
 Phase-locked and non-phase-locked RMS diagnostics use complete nonoverlapping trigger epochs;
 phase locking does not uniquely identify scanner artifact or neural activity.

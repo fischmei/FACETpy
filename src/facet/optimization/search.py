@@ -98,7 +98,7 @@ BAD_OBJECTIVES = (1.0e6, 1.0e6)
 WINDOW_SIZE_CHOICES = (10, 20, 30)
 K_CHOICES = (5, 10)
 SEARCH_SPACE_VERSION = 3
-EVALUATION_CACHE_VERSION = 4
+EVALUATION_CACHE_VERSION = 5
 
 
 def _load_optuna() -> Any:
@@ -318,6 +318,7 @@ class RunSettings:
     def evaluation_signature_payload(self) -> dict[str, Any]:
         """Return only settings that can change raw per-recipe metrics."""
         from facet.optimization.cleaning import DEFAULT_CLEANING
+        from facet.optimization.metrics import METRIC_VERSION, MIN_PRESERVATION_COVERAGE
 
         return {
             "fixed_cleaning": DEFAULT_CLEANING.manifest() if self.evaluation_mode != "non-reference" else None,
@@ -328,6 +329,10 @@ class RunSettings:
             "screening_sections": self.screening_sections,
             "assume_reference_aligned": self.assume_reference_aligned,
             "evaluation_cache_version": EVALUATION_CACHE_VERSION,
+            "preservation_policy": {
+                "metric_version": METRIC_VERSION,
+                "minimum_channel_time": MIN_PRESERVATION_COVERAGE,
+            },
             "trigger_regex": self.trigger_regex,
             "upsample_factor": self.upsample_factor,
             "chunk_padding_seconds": self.chunk_padding_seconds,

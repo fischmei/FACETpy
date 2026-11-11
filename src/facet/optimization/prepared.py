@@ -9,6 +9,7 @@ from uuid import uuid4
 
 import mne
 import numpy as np
+import pandas as pd
 from loguru import logger
 
 from facet import Flex, Loader, MotionEpochMetadata, TriggerDetector
@@ -29,6 +30,8 @@ from facet.optimization.cleaning import (
     validate_cleaning_input,
 )
 from facet.optimization.metrics import (
+    BANDS,
+    MIN_PRESERVATION_COVERAGE,
     original_spectrum,
     spectral_metrics,
     trigger_locked_metrics,
@@ -36,7 +39,7 @@ from facet.optimization.metrics import (
 )
 from facet.optimization.reference import compare_chunk, reference_plan
 
-PREPARATION_VERSION = 3
+PREPARATION_VERSION = 4
 
 
 def atomic_json(path, payload):
@@ -210,6 +213,7 @@ def prepare_dataset(dataset, settings, root: Path):
             "fixed_cleaning": DEFAULT_CLEANING.manifest() if full_cleaning else None,
             "preparation_version": PREPARATION_VERSION,
         }
+        coverage_rows = []
         for index, (start, stop, core_start, core_stop, epoch_indices) in enumerate(intervals):
             if full_cleaning:
                 # Integer-second padded origins share an exact grid with the
@@ -240,7 +244,7 @@ def prepare_dataset(dataset, settings, root: Path):
                 data = raw.get_data(picks=[pick], start=start, stop=stop)[0]
                 original = data[core_start - start : core_stop - start]
                 if raw.ch_names[pick] in eeg_names:
-                    _save_original_metrics(
+                    diagnostics = _save_original_metrics(
                         folder,
                         channel,
                         original,
@@ -250,6 +254,20 @@ def prepare_dataset(dataset, settings, root: Path):
                         settings,
                         f"dataset '{dataset.dataset_id}', chunk {index}, channel '{raw.ch_names[pick]}'",
                     )
+                    for band, item in diagnostics.items():
+                        coverage_rows.append(
+                            dict(
+                                dataset_id=dataset.dataset_id,
+                                chunk=index,
+                                channel=raw.ch_names[pick],
+                                channel_index=channel,
+                                band=band,
+                                duration_seconds=(core_stop - core_start) / sfreq,
+                                valid_measurements=int(item["valid"]),
+                                invalid_measurements=int(not item["valid"]),
+                                **{key: value for key, value in item.items() if key != "mask"},
+                            )
+                        )
                 signal = mne.io.RawArray(
                     data[None, :], mne.create_info([raw.ch_names[pick]], sfreq, "eeg"), verbose=False
                 )
@@ -264,6 +282,7 @@ def prepare_dataset(dataset, settings, root: Path):
                     raise ValueError("Non-finite epoch data.")
                 np.save(folder / f"{channel}_epochs.npy", epochs)
                 del signal, upsampled, epochs, data
+        manifest["preservation_coverage"] = preservation_coverage_report(coverage_rows, manifest, settings, directory)
         atomic_json(marker, manifest)  # Commit only a fully prepared dataset.
     finally:
         raw.close()
@@ -274,7 +293,7 @@ def prepare_dataset(dataset, settings, root: Path):
 
 def _save_original_metrics(folder, channel, original, sfreq, triggers, artifact_length, settings, label):
     frequencies, psd, mask = original_spectrum(original, sfreq, triggers, settings)
-    validate_clean_band_coverage(
+    diagnostics = validate_clean_band_coverage(
         frequencies,
         psd,
         mask,
@@ -286,9 +305,76 @@ def _save_original_metrics(folder, channel, original, sfreq, triggers, artifact_
         frequencies=frequencies,
         psd=psd,
         mask=mask,
+        band_valid=np.array([diagnostics[band]["valid"] for band in BANDS]),
         original_rms=np.sqrt(np.mean(original**2)),
         original_trigger_locked_rms=original_locked["trigger_locked_rms"],
     )
+    for item in diagnostics.values():
+        item["welch_resolution_hz"] = float(frequencies[1] - frequencies[0])
+    return diagnostics
+
+
+def evaluation_indices(manifest, settings, fidelity):
+    """One original-defined selection shared by coverage checks and every trial."""
+    chunks = list(range(len(manifest["chunks"])))
+    channels = list(range(len(manifest["channels"])))
+    multiplier = {"screening": 1, "expanded": 2}.get(fidelity)
+    if multiplier is not None:
+        chunks = subset_indices(len(chunks), settings.screening_sections * multiplier)
+        if settings.evaluation_mode == "non-reference":
+            channels = subset_indices(len(channels), settings.screening_channels * multiplier)
+    return chunks, channels
+
+
+def preservation_coverage_report(rows, manifest, settings, directory):
+    """Require majority channel-time support in every band at every fidelity."""
+    from facet.optimization.search import _atomic_write_csv
+
+    _atomic_write_csv(pd.DataFrame(rows), directory / "clean_band_coverage.csv")
+    summary, failures = [], []
+    for fidelity in ("screening", "expanded", "full"):
+        chunks, channels = evaluation_indices(manifest, settings, fidelity)
+        for band in BANDS:
+            selected = [
+                row
+                for row in rows
+                if row["chunk"] in chunks and row["channel_index"] in channels and row["band"] == band
+            ]
+            total = sum(row["duration_seconds"] for row in selected)
+            valid = [row for row in selected if row["valid"]]
+            fraction = sum(row["duration_seconds"] for row in valid) / total if total else 0.0
+            summary.append(
+                dict(
+                    fidelity=fidelity,
+                    band=band,
+                    coverage=fraction,
+                    valid_measurements=len(valid),
+                    invalid_measurements=len(selected) - len(valid),
+                    total_channel_seconds=total,
+                )
+            )
+            if fraction < MIN_PRESERVATION_COVERAGE:
+                failures.append(
+                    f"{fidelity}/{band}: {fraction:.1%} valid channel-time ({len(valid)}/{len(selected)} measurements)"
+                )
+    payload = {"minimum_channel_time_coverage": MIN_PRESERVATION_COVERAGE, "summary": summary}
+    atomic_json(directory / "preservation_coverage.json", payload)
+    logger.info(
+        "Original preservation coverage for {}: {} valid / {} unavailable measurements; reports in {}",
+        rows[0]["dataset_id"] if rows else "unknown",
+        sum(row["valid"] for row in rows),
+        sum(not row["valid"] for row in rows),
+        directory,
+    )
+    if failures:
+        raise ValueError(
+            f"Clean-band coverage preflight failed for dataset {rows[0]['dataset_id'] if rows else 'unknown'}: "
+            + "; ".join(failures)
+            + f". Require at least {MIN_PRESERVATION_COVERAGE:.0%} valid channel-time per band and fidelity; "
+            f"see {directory / 'clean_band_coverage.csv'}. Individual measurements still require 25% clean bins, "
+            "two bins and finite positive original power. No trials started."
+        )
+    return payload
 
 
 def estimated_job_mb(samples, factor, epochs):
@@ -367,19 +453,8 @@ class CachedBuilder(AveragingMatrixBuilder):
 
 def evaluate_prepared(decisions, dataset, settings, directory, cache, fidelity, diagnostics_directory=None):
     manifest = json.loads((directory / "prepared.json").read_text())
-    chunk_ids = list(range(len(manifest["chunks"])))
-    channel_ids = list(range(len(manifest["channels"])))
+    chunk_ids, channel_ids = evaluation_indices(manifest, settings, fidelity)
     full_cleaning = settings.evaluation_mode != "non-reference"
-    if fidelity == "screening":
-        chunk_ids = subset_indices(len(chunk_ids), settings.screening_sections)
-        channel_ids = subset_indices(len(channel_ids), settings.screening_channels)
-    elif fidelity == "expanded":
-        chunk_ids = subset_indices(len(chunk_ids), settings.screening_sections * 2)
-        channel_ids = subset_indices(len(channel_ids), settings.screening_channels * 2)
-    if full_cleaning:
-        # Average reference and cardiac cleaning must use the same channel set
-        # at every fidelity. Screening reduces time sections, not these inputs.
-        channel_ids = list(range(len(manifest["channels"])))
     sfreq, factor = manifest["sfreq"], settings.upsample_factor
     chunk_rows, weights = [], []
     flex = Flex(
@@ -474,7 +549,14 @@ def evaluate_prepared(decisions, dataset, settings, directory, cache, fidelity, 
                     continue
             corrected = raw._data[0, chunk["core_start"] : chunk["core_stop"]]
             with np.load(folder / f"{channel}_spectrum.npz") as spectrum:
-                metrics = spectral_metrics(corrected, sfreq, spectrum["frequencies"], spectrum["psd"], spectrum["mask"])
+                metrics = spectral_metrics(
+                    corrected,
+                    sfreq,
+                    spectrum["frequencies"],
+                    spectrum["psd"],
+                    spectrum["mask"],
+                    band_valid=spectrum["band_valid"],
+                )
             locked = trigger_locked_metrics(
                 corrected, triggers // factor - chunk["core_start"], manifest["artifact_length"] // factor
             )
@@ -517,7 +599,12 @@ def evaluate_prepared(decisions, dataset, settings, directory, cache, fidelity, 
             del corrected_raw, cleaned
         chunk_rows.append(metrics)
         weights.append(chunk["core_stop"] - chunk["core_start"])
-    result = aggregate_metrics(chunk_rows, weights)
+    result = aggregate_metrics(chunk_rows, np.asarray(weights) / sfreq)
+    channel_seconds = (
+        sum(weights) / sfreq * sum(manifest["channels"][channel] in manifest["eeg_channels"] for channel in channel_ids)
+    )
+    for band in BANDS:
+        result[f"{band}_measurement_coverage"] = result[f"{band}_preservation_weight"] / channel_seconds
     if full_cleaning:
         result["reference_valid_seconds"] = sum(row["reference_valid_seconds"] for row in chunk_rows)
         result["reference_evaluated_seconds"] = sum(weights) / sfreq
@@ -530,17 +617,38 @@ def evaluate_prepared(decisions, dataset, settings, directory, cache, fidelity, 
         n_channels=sum(manifest["channels"][channel] in manifest["eeg_channels"] for channel in channel_ids),
         reference_available=manifest["reference_available"],
     )
-    # Insufficient coverage is an infeasible metric result, never a plausible
-    # preservation score. Correction success and metric validity are separate.
+    # Preparation fixes eligibility. Candidate-dependent loss is fatal rather
+    # than silently shrinking a preservation denominator.
+    required = ["nonpeak_eeg_log_deviation", *(f"{band}_preservation" for band in BANDS)]
+    if any(not np.isfinite(result[key]) for key in required):
+        raise ValueError("No finite preservation summary on the fixed original-defined measurement set.")
     result["success"] = True
     return result
 
 
 def aggregate_metrics(rows, weights=None):
-    """Equal channels, duration-weighted chunks; never weight datasets by chunks."""
+    """Preserve fixed eligible channel-time denominators through both levels."""
     result = {}
+    weights = np.ones(len(rows)) if weights is None else np.asarray(weights, dtype=float)
     for key in sorted({key for row in rows for key in row}):
+        if key.endswith("_weight"):
+            continue
         values = np.asarray([row.get(key, np.nan) for row in rows], dtype=float)
-        # Do not hide insufficient clean coverage in a channel/section.
+        if key.endswith(("_valid_measurements", "_invalid_measurements")):
+            result[key] = float(np.sum(values))
+            continue
+        if any(f"{key}_weight" in row for row in rows):
+            fixed = np.asarray([row[f"{key}_weight"] for row in rows]) * weights
+            eligible = fixed > 0
+            if not np.all(np.isfinite(values[eligible])):
+                raise ValueError(f"Candidate lost an eligible preservation measurement: {key}.")
+            result[f"{key}_weight"] = float(fixed.sum())
+            result[key] = (
+                float(np.average(values[eligible], weights=fixed[eligible])) if eligible.any() else float("nan")
+            )
+            continue
         result[key] = float(np.average(values, weights=weights)) if np.all(np.isfinite(values)) else float("nan")
+    if any(f"{band}_log_deviation_weight" in result for band in BANDS):
+        deviations = [result[f"{band}_log_deviation"] for band in BANDS]
+        result["nonpeak_eeg_log_deviation"] = float(np.mean(deviations))
     return result
