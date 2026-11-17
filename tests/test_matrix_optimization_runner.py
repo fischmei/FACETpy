@@ -271,5 +271,5 @@ def test_parameter_stability_flattens_selected_recipe_manifests():
     stability = runner.parameter_stability(frame)
 
     target = stability[stability["parameter"] == "target_policy"].iloc[0]
-    assert target["value"] == "exclude_target"
+    assert target["value"] == "include_target"
     assert target["fraction"] == 1.0

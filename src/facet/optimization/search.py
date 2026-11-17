@@ -770,6 +770,8 @@ def anchor_parameter_sets(capabilities: SearchCapabilities) -> list[tuple[str, d
     independently per-target recipe.  This distinction is retained in every
     report instead of overstating legacy recovery.
     """
+    # Keep flex_default as the historical benchmark label, independent of
+    # the current library default (now the structural_volume anchor).
     anchors = [
         ("flex_default", _fixed_parameters()),
         ("aas_per_target", _fixed_parameters(target_policy=TargetPolicy.INCLUDE.value)),

@@ -157,6 +157,14 @@ AveragingMatrixBuilder
 MatrixDecisions
 ~~~~~~~~~~~~~~~
 
+The default is the NATVIEW optimized six-past/four-future, target-inclusive,
+consecutive, no-scoring, select-all, equal-weight recipe. Use
+``MatrixDecisions.optimized_flex()`` to name it explicitly or
+``MatrixDecisions.legacy_flex()`` for the previous future-first Pearson recipe.
+Explicit legacy constructor controls retain their historical behavior;
+``matrix_decisions`` takes precedence. Alpha scaling and gap interpolation
+remain disabled by default.
+
 .. autoclass:: MatrixDecisions
    :members:
 

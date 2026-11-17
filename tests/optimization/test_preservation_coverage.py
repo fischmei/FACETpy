@@ -114,7 +114,7 @@ def test_isolated_failure_is_prepared_reported_and_reused(recording, settings, t
     try:
         first = prepared.evaluate_prepared(MatrixDecisions(), dataset, settings, directory, cache, "full")
         second = prepared.evaluate_prepared(
-            replace(MatrixDecisions(), template_size=TemplateSizePolicy.minimum(3)),
+            replace(MatrixDecisions.legacy_flex(), template_size=TemplateSizePolicy.minimum(3)),
             dataset,
             settings,
             directory,

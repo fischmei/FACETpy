@@ -220,8 +220,10 @@ Architecture and fixed correction lifecycle
 leave-one-recording-out selection. ``cache``, ``prepared``, ``metrics``, and
 ``reports`` separate persistence, signal preparation, evaluation, and reporting.
 The example file is a compatibility wrapper for diagnostic example imports.
-The public Flex processor and the other processors retain their defaults and
-behavior. The new ``AveragingMatrixBuilder.build_sparse`` method preserves the
+The matrix search leaves lifecycle defaults unchanged. The public Flex matrix
+default now uses the NATVIEW optimized ``structural_volume`` recipe; the
+``flex_default`` optimization anchor retains the historical future-first
+Pearson recipe for backward-compatible benchmark comparisons. The new ``AveragingMatrixBuilder.build_sparse`` method preserves the
 same candidate, selection, and normalized weighting rules as the dense builder.
 
 Only averaging-matrix choices vary. The lifecycle always upsamples, constructs

@@ -45,19 +45,16 @@ ARTIFACT_TEMPLATE_PREVIEW_COLUMNS = 12
 class Flex(Processor):
     """Remove trigger-locked artifacts with configurable epoch averaging.
 
-    Flex builds one artifact template for every target epoch. Without an
-    explicit ``matrix_decisions`` recipe, it searches the following
-    ``window_size`` epochs first and, near the end of a recording, backfills
-    the candidate window with the nearest preceding epochs. The target epoch
-    is excluded from this compatibility rule.
+    By default, each template equally averages six past and four future
+    candidates plus the target, using consecutive sampling, no scoring, and
+    no motion restrictions. Unavailable candidates are filled from the other
+    direction. See ``MatrixDecisions.optimized_flex()``.
 
-    In the compatibility rule, every candidate whose signed Pearson
-    correlation meets ``threshold`` is accepted. If this produces fewer than
-    ``min_accepted`` epochs, the strongest valid remaining correlations are
-    added even though they are below the threshold. Selected epochs are then
-    averaged either equally or with a Gaussian kernel that favors epochs
-    temporally closer to the target. ``matrix_decisions`` opens these stages
-    as independent, typed policies without changing the surrounding lifecycle.
+    Explicitly supplying any of ``window_size``, ``threshold``,
+    ``min_accepted``, or ``N_distribution`` selects the historical future-first,
+    target-excluding Pearson recipe with the remaining legacy defaults.
+    Explicit ``matrix_decisions`` takes precedence over these compatibility
+    controls and keeps every decision independently configurable.
 
     Flex owns the common template-correction lifecycle used by every
     ``N = A @ D`` correction in FACETpy. For each channel it extracts an epoch
@@ -69,21 +66,21 @@ class Flex(Processor):
 
     Parameters
     ----------
-    window_size : int
+    window_size : int, optional
         Maximum number of non-target epochs considered for each target
-        (default: 10).
-    threshold : float
+        (legacy default: 10).
+    threshold : float, optional
         Minimum signed Pearson correlation required for automatic acceptance,
-        in the interval ``(0, 1]`` (default: 0.975).
-    min_accepted : int
+        in the interval ``(0, 1]`` (legacy default: 0.975).
+    min_accepted : int, optional
         Minimum number of candidates used when enough non-target epochs are
         available. Below-threshold candidates are added in descending
-        correlation order when necessary (default: 5).
-    N_distribution : {"equal", "normal"}
+        correlation order when necessary (legacy default: 5).
+    N_distribution : {"equal", "normal"}, optional
         Weight distribution across accepted epochs. ``"equal"`` assigns the
         same weight to every accepted epoch. ``"normal"`` applies a Gaussian
         kernel to temporal distance from the target, with standard deviation
-        ``max(effective_window_size / 3, 1)`` (default: ``"equal"``).
+        ``max(effective_window_size / 3, 1)`` (legacy default: ``"equal"``).
     plot_artifacts : bool
         If ``True``, plot a representative artifact template and its matrices
         (default: ``False``).
@@ -106,13 +103,13 @@ class Flex(Processor):
         (default: ``True``).
     matrix_decisions : MatrixDecisions or mapping, optional
         Complete composable recipe for constructing ``A``. When supplied, it
-        replaces only Flex's native future-first matrix rule; extraction,
+        replaces only the default matrix rule; extraction,
         ``N = A @ D``, realignment, alpha scaling, subtraction, noise tracking,
         and reporting remain unchanged.
     """
 
     name = "flex_correction"
-    description = "Flexible per-epoch correlation-based artifact subtraction"
+    description = "Flexible per-epoch template artifact subtraction"
     version = "1.0.0"
 
     requires_triggers = True
@@ -128,10 +125,10 @@ class Flex(Processor):
 
     def __init__(
         self,
-        window_size: int = 10,
-        threshold: float = 0.975,
-        min_accepted: int = 5,
-        N_distribution: DistributionName = "equal",
+        window_size: int | None = None,
+        threshold: float | None = None,
+        min_accepted: int | None = None,
+        N_distribution: DistributionName | None = None,
         plot_artifacts: bool = False,
         realign_after_averaging: bool = True,
         search_window_factor: float = 3.0,
@@ -141,6 +138,16 @@ class Flex(Processor):
         *,
         matrix_decisions: MatrixDecisions | Mapping[str, Any] | None = None,
     ) -> None:
+        legacy_requested = any(
+            value is not None for value in (window_size, threshold, min_accepted, N_distribution)
+        )
+        window_size = 10 if window_size is None else window_size
+        threshold = 0.975 if threshold is None else threshold
+        min_accepted = 5 if min_accepted is None else min_accepted
+        N_distribution = "equal" if N_distribution is None else N_distribution
+        if matrix_decisions is None and not legacy_requested:
+            matrix_decisions = MatrixDecisions.optimized_flex()
+
         if isinstance(matrix_decisions, Mapping):
             matrix_decisions = MatrixDecisions.from_dict(matrix_decisions)
         if matrix_decisions is not None and not isinstance(matrix_decisions, MatrixDecisions):

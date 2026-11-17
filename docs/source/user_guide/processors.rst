@@ -419,14 +419,45 @@ The compatibility name for the closest per-target AAS-like Flex recipe:
    )
    context = aas.execute(context)
 
-**Flex** - Flexible correlation-based artifact subtraction
+**Flex** - Flexible template artifact subtraction
 
-``Flex`` creates a separate artifact template for every target epoch and EEG
-channel. Its candidate window is exact and future-first: it takes the next
-``window_size`` non-target epochs when they exist. Near the end of the
-recording, it fills only the missing positions with the nearest preceding
-epochs. The target epoch is never included. If the recording contains fewer
-than ``window_size + 1`` epochs, all available non-target epochs are used.
+``Flex()`` and ``FlexCorrection()`` use the NATVIEW optimized matrix recipe:
+a window of ten non-target candidates (six past, four future), consecutive
+sampling with stride and start offset 1, target inclusion, no candidate scoring,
+select-all templates (``k=None``), equal weights, and no motion restrictions.
+All inactive scoring and weighting fields are ``None``. At boundaries, missing
+candidates are filled from the other direction. With enough epochs, each row
+therefore has eleven weights of ``1 / 11`` including the target.
+
+This is ``MatrixDecisions.optimized_flex()``, identical to the
+``structural_volume`` anchor (configuration ID ``2c8dac1db45f353d6a7f``), selected
+in all five outer folds on 22 NATVIEW participants. It changes matrix building
+only: ``apply_epoch_alpha_scaling`` and ``interpolate_volume_gaps`` still default
+to ``False``.
+
+.. code-block:: python
+
+   from facet.correction import FlexCorrection, MatrixDecisions
+
+   flex = FlexCorrection()  # Optimized recipe.
+   legacy = FlexCorrection(matrix_decisions=MatrixDecisions.legacy_flex())
+
+The named preset ``flex_default`` now uses this optimized recipe; ``flex_legacy``
+retains the previous recipe. Historical optimization reports retain the label
+``flex_default`` for the original benchmark anchor.
+
+Explicitly supplying any legacy matrix control (``window_size``, ``threshold``,
+``min_accepted``, or ``N_distribution``), even its historical default value,
+selects the historical recipe when ``matrix_decisions`` is omitted. The other
+legacy values resolve to 10, 0.975, 5, and ``"equal"`` respectively. The CLI
+uses the optimized recipe for ``--correction-mode=flex`` unless ``--window-size``
+or a ``--flex-*`` matrix control is supplied. An explicit ``matrix_decisions``
+recipe takes precedence and allows all policies to vary independently.
+
+The historical recipe is future-first and excludes the target. It takes the
+next ``window_size`` non-target epochs, filling unavailable positions with
+preceding epochs. For recordings shorter than the window, it uses all available
+non-target epochs.
 
 For example, with eight epochs numbered 0 through 7 and ``window_size=4``:
 
@@ -434,7 +465,7 @@ For example, with eight epochs numbered 0 through 7 and ``window_size=4``:
 - target 6 uses ``[3, 4, 5, 7]`` (one future epoch and three backfilled epochs);
 - target 7 uses ``[3, 4, 5, 6]`` (four backfilled epochs).
 
-Without an explicit ``matrix_decisions`` recipe, candidates with a signed
+In the historical recipe, candidates with a signed
 Pearson correlation greater than or equal to
 ``threshold`` are accepted. All candidates that pass remain selected, even
 when their number exceeds ``min_accepted``. If too few pass, the remaining

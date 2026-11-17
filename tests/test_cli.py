@@ -1018,3 +1018,16 @@ def test_bids_plan_derives_subject_and_run_from_chunk_names(tmp_path):
         (chunk_1.resolve(), "myrecording", "1"),
         (chunk_2.resolve(), "myrecording", "2"),
     ]
+
+
+def test_cli_flex_default_is_optimized_and_explicit_controls_are_legacy():
+    from facet.correction import MatrixDecisions
+
+    parser = cli._build_parser()
+    base = ["process", "--input", "recording.edf", "--output-dir", "corrected", "--correction-mode", "flex"]
+    processor = cli._build_template_correction(parser.parse_args(base))
+    assert processor.matrix_decisions == MatrixDecisions.optimized_flex()
+    for option in (["--flex-threshold", "0.975"], ["--flex-distribution", "equal"],
+                   ["--flex-min-accepted", "5"], ["--window-size", "10"]):
+        processor = cli._build_template_correction(parser.parse_args(base + option))
+        assert processor.matrix_decisions == MatrixDecisions.legacy_flex()

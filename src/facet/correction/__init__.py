@@ -53,6 +53,7 @@ from .presets import (
     CORRESPONDING_SLICE,
     FARM_PER_TARGET_K10,
     FLEX_DEFAULT,
+    FLEX_LEGACY,
     LEGACY_RESEMBLANCE,
     MOOSMANN_COST,
     PRESET_BUILDERS,
@@ -89,6 +90,7 @@ __all__ = [
     "MOTION_METADATA_KEY",
     # Named Flex recipes
     "FLEX_DEFAULT",
+    "FLEX_LEGACY",
     "AAS_PER_TARGET",
     "FARM_PER_TARGET_K10",
     "STRUCTURAL_VOLUME",

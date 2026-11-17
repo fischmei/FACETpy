@@ -36,6 +36,7 @@ from facet.correction.presets import (
     AAS_PER_TARGET,
     FARM_PER_TARGET_K10,
     FLEX_DEFAULT,
+    FLEX_LEGACY,
     MOOSMANN_COST,
     STRUCTURAL_SLICE,
     STRUCTURAL_VOLUME,
@@ -118,9 +119,10 @@ class TestNamedLegacyPresets:
         }
 
     def test_flex_and_aas_manifests(self):
-        """AAS differs from default Flex only by including the target."""
+        """AAS differs from historical Flex only by including the target."""
         expected = self._base_manifest()
-        assert build_flex_preset(FLEX_DEFAULT).to_dict() == expected
+        assert build_flex_preset(FLEX_LEGACY).to_dict() == expected
+        assert MatrixDecisions.legacy_flex().to_dict() == expected
 
         aas_expected = {**expected, "target_policy": "include_target"}
         assert build_flex_preset(AAS_PER_TARGET).to_dict() == aas_expected
@@ -577,6 +579,7 @@ class TestRevisedScoringAndTemplateSize:
             )
         )
         common = {
+            "target_policy": TargetPolicy.EXCLUDE,
             "quota": DirectionalQuota.global_pool(),
             "template_size": TemplateSizePolicy.exactly(1),
             "weighting": WeightingPolicy.equal(),
@@ -608,6 +611,7 @@ class TestRevisedScoringAndTemplateSize:
     def test_nonfinite_cost_candidate_is_not_used_to_fill_exactly_k(self):
         """An invalid motion path should remain unavailable when k is unmet."""
         decisions = MatrixDecisions(
+            target_policy=TargetPolicy.EXCLUDE,
             quota=DirectionalQuota.global_pool(),
             scoring=CandidateScoringPolicy.temporal_motion_cost(
                 temporal_weight=0.0,
@@ -635,6 +639,7 @@ class TestRevisedScoringAndTemplateSize:
     def test_selection_score_is_not_reused_as_weight(self):
         """Contributor ranking and row coefficients must remain separate stages."""
         decisions = MatrixDecisions(
+            target_policy=TargetPolicy.EXCLUDE,
             quota=DirectionalQuota.future_only(2),
             scoring=CandidateScoringPolicy.signed_pearson(0.5),
             template_size=TemplateSizePolicy.exactly(2),
@@ -902,3 +907,85 @@ class TestDecisionValidationAndIntegration:
 
         with pytest.raises(ProcessorValidationError, match="requires slices_per_volume"):
             Flex(matrix_decisions=decisions).validate(context)
+
+
+@pytest.mark.unit
+class TestOptimizedFlexDefault:
+    def test_exact_manifest_and_configuration_id(self):
+        from facet.optimization.search import configuration_id
+
+        expected = {
+            "quota": {"window_size": 10, "past": 6, "future": 4, "global_mode": False},
+            "sampling": {"mode": "consecutive", "stride": 1, "start_offset": 1},
+            "motion": {
+                "same_motion_segment": False,
+                "motion_stable_only": False,
+                "max_motion_distance": None,
+            },
+            "target_policy": "include_target",
+            "scoring": {
+                "mode": "none", "threshold": None, "temporal_weight": None,
+                "motion_weight": None, "temporal_unit": None,
+            },
+            "template_size": {"mode": "select_all", "k": None},
+            "weighting": {
+                "kernel": "equal", "basis": None, "temporal_unit": None,
+                "sigma": None, "scale": None, "degrees_of_freedom": None,
+            },
+        }
+        for recipe in (MatrixDecisions(), MatrixDecisions.optimized_flex(),
+                       build_flex_preset(FLEX_DEFAULT), build_flex_preset(STRUCTURAL_VOLUME)):
+            assert recipe.to_dict() == expected
+            assert configuration_id(recipe) == "2c8dac1db45f353d6a7f"
+            assert MatrixDecisions.from_dict(expected) == recipe
+
+    @pytest.mark.parametrize("count", [1, 4, 11, 30])
+    def test_actual_default_dense_sparse_weights_and_reconstruction(self, count):
+        processor = facet.FlexCorrection()
+        epochs = np.random.default_rng(42).normal(size=(count, 12))
+        matrix = processor._calc_averaging_matrix(epochs, 10, 0.0, 0.975)
+        assert processor.matrix_decisions == MatrixDecisions.optimized_flex()
+        assert processor.apply_epoch_alpha_scaling is False
+        assert processor.interpolate_volume_gaps is False
+        assert processor._last_matrix_decision_manifest == MatrixDecisions().to_dict()
+        assert np.isfinite(matrix).all() and (matrix >= 0).all()
+        np.testing.assert_allclose(matrix.sum(axis=1), 1.0)
+        np.testing.assert_allclose(matrix[matrix > 0], 1 / min(count, 11))
+        assert np.all(np.diag(matrix) > 0)
+        if count == 30:
+            np.testing.assert_array_equal(np.flatnonzero(matrix[15]), np.arange(9, 20))
+        sparse = AveragingMatrixBuilder().build_sparse(epochs)
+        np.testing.assert_allclose(matrix, sparse.toarray())
+        restored = facet.FlexCorrection(**processor._get_parameters())
+        assert restored.matrix_decisions == processor.matrix_decisions
+
+    @pytest.mark.parametrize("controls", [
+        {"window_size": 10}, {"threshold": 0.975},
+        {"min_accepted": 5}, {"N_distribution": "equal"},
+        {"window_size": 7, "threshold": 0.8, "min_accepted": 3, "N_distribution": "normal"},
+    ])
+    def test_explicit_legacy_controls_are_honored(self, controls):
+        processor = Flex(**controls)
+        epochs = _scaled_epochs(20)
+        matrix = processor._calc_averaging_matrix(
+            epochs, processor.window_size, 0.0, processor.threshold,
+        )
+        expected = MatrixDecisions.legacy_flex(
+            window_size=processor.window_size, threshold=processor.threshold,
+            min_accepted=processor.min_accepted, distribution=processor.N_distribution,
+        )
+        np.testing.assert_allclose(matrix, AveragingMatrixBuilder(expected).build(epochs))
+        assert not np.diag(matrix).any()
+        assert processor._last_matrix_decision_manifest == expected.to_dict()
+
+    def test_custom_recipe_overrides_legacy_controls(self):
+        custom = _decisions(
+            quota=DirectionalQuota.past_only(3),
+            weighting=WeightingPolicy.gaussian(sigma=2),
+        )
+        processor = Flex(window_size=10, threshold=0.975, matrix_decisions=custom.to_dict())
+        epochs = _scaled_epochs(20)
+        actual = processor._calc_averaging_matrix(epochs, 10, 0.0, 0.975)
+        np.testing.assert_allclose(actual, AveragingMatrixBuilder(custom).build(epochs))
+        assert processor.matrix_decisions == custom
+        assert build_flex_preset(FLEX_DEFAULT, threshold=0.975) == MatrixDecisions.legacy_flex()

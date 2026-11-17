@@ -213,7 +213,7 @@ def _outer_test(test, training, selected, settings, cache, directory, fold_index
     )
     recipes = {
         "optimized": MatrixDecisions.from_dict(selected["recipe"]),
-        "flex_default": MatrixDecisions(),
+        "flex_default": anchors["flex_default"],  # Historical benchmark label.
         "aas_per_target": anchors["aas_per_target"],
         "farm_per_target_k10": anchors["farm_per_target_k10"],
     }

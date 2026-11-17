@@ -10,6 +10,7 @@ explicit, serializable, and easy to report.
 from __future__ import annotations
 
 from collections.abc import Callable
+from dataclasses import replace
 
 from .flex import (
     CandidateScoringPolicy,
@@ -24,6 +25,7 @@ from .flex import (
 )
 
 FLEX_DEFAULT = "flex_default"
+FLEX_LEGACY = "flex_legacy"
 AAS_PER_TARGET = "aas_per_target"
 FARM_PER_TARGET_K10 = "farm_per_target_k10"
 STRUCTURAL_VOLUME = "structural_volume"
@@ -42,7 +44,8 @@ CLI_CORRECTION_PRESETS = {
 }
 
 LEGACY_RESEMBLANCE = {
-    FLEX_DEFAULT: "default Flex",
+    FLEX_DEFAULT: "optimized Flex (structural_volume)",
+    FLEX_LEGACY: "historical future-first Flex",
     AAS_PER_TARGET: "AAS (per-target approximation)",
     FARM_PER_TARGET_K10: "FARM (per-target, maximum 10 templates)",
     STRUCTURAL_VOLUME: "volume-trigger structural averaging",
@@ -54,12 +57,30 @@ LEGACY_RESEMBLANCE = {
 
 def flex_default(
     *,
+    window_size: int | None = None,
+    threshold: float | None = None,
+    template_size: int | None = None,
+    weighting: WeightingPolicy | None = None,
+) -> MatrixDecisions:
+    """Return optimized Flex, or the legacy recipe for explicit legacy controls."""
+    if all(value is None for value in (window_size, threshold, template_size, weighting)):
+        return MatrixDecisions.optimized_flex()
+    return flex_legacy(
+        window_size=10 if window_size is None else window_size,
+        threshold=0.975 if threshold is None else threshold,
+        template_size=5 if template_size is None else template_size,
+        weighting=weighting,
+    )
+
+
+def flex_legacy(
+    *,
     window_size: int = 10,
     threshold: float = 0.975,
     template_size: int = 5,
     weighting: WeightingPolicy | None = None,
 ) -> MatrixDecisions:
-    """Return the default future-first Flex recipe."""
+    """Return the historical future-first Flex recipe."""
     return MatrixDecisions(
         quota=DirectionalQuota.future_only(window_size),
         sampling=SamplingPolicy.consecutive(),
@@ -114,21 +135,15 @@ def farm_per_target_k10(
 
 def structural_volume(*, window_size: int = 10) -> MatrixDecisions:
     """Return fixed neighboring-volume structural averaging decisions."""
-    # The established ten-candidate recipe is slightly past-heavy (6/4).
-    # Preserve that proportion when a caller explicitly changes the window.
+    # Preserve the established 60/40 split for explicitly changed windows.
     past = min(window_size, int(round(window_size * 0.6)))
-    return MatrixDecisions(
+    return replace(
+        MatrixDecisions.optimized_flex(),
         quota=DirectionalQuota.custom(
             window_size=window_size,
             past=past,
             future=window_size - past,
         ),
-        sampling=SamplingPolicy.consecutive(),
-        motion=MotionEligibility(),
-        target_policy=TargetPolicy.INCLUDE,
-        scoring=CandidateScoringPolicy.none(),
-        template_size=TemplateSizePolicy.select_all(),
-        weighting=WeightingPolicy.equal(),
     )
 
 
@@ -187,6 +202,7 @@ def moosmann_cost(*, template_size: int = 60) -> MatrixDecisions:
 
 PRESET_BUILDERS: dict[str, Callable[..., MatrixDecisions]] = {
     FLEX_DEFAULT: flex_default,
+    FLEX_LEGACY: flex_legacy,
     AAS_PER_TARGET: aas_per_target,
     FARM_PER_TARGET_K10: farm_per_target_k10,
     STRUCTURAL_VOLUME: structural_volume,
@@ -212,6 +228,7 @@ __all__ = [
     "CORRESPONDING_SLICE",
     "FARM_PER_TARGET_K10",
     "FLEX_DEFAULT",
+    "FLEX_LEGACY",
     "LEGACY_RESEMBLANCE",
     "MOOSMANN_COST",
     "PRESET_BUILDERS",
@@ -222,6 +239,7 @@ __all__ = [
     "corresponding_slice",
     "farm_per_target_k10",
     "flex_default",
+    "flex_legacy",
     "moosmann_cost",
     "structural_slice",
     "structural_volume",

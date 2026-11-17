@@ -108,7 +108,7 @@ def _validate_single_recording(dataset, settings, cache, directory):
         if previous.get("identity") == identity and previous.get("passed"):
             return previous
     started = time.perf_counter()
-    baseline = MatrixDecisions()
+    baseline = MatrixDecisions.legacy_flex()
     variant = replace(baseline, quota=DirectionalQuota.symmetric(20))
     fixed_before = DEFAULT_CLEANING.manifest()
     with threadpool_limits(limits=1):

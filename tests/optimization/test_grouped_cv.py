@@ -380,3 +380,23 @@ def test_grouped_output_cannot_reuse_legacy_run_manifest(tmp_path):
     (tmp_path / "run_manifest.json").write_text(json.dumps({"settings": {"optimizer_settings": {}}}))
     with pytest.raises(ValueError, match="Incompatible CV strategy"):
         check_compatibility(datasets, settings, plan, args)
+
+
+def test_outer_test_keeps_historical_flex_baseline(monkeypatch, tmp_path):
+    from facet.correction import MatrixDecisions
+    from facet.optimization.grouped import _outer_test
+
+    pytest.importorskip("optuna")
+    datasets = datasets_at(tmp_path, participants=2, multiple=False)
+    seen = []
+
+    def evaluate(recipe, test, settings, cache, fidelity):
+        seen.append(recipe)
+        return [{"dataset_id": item.dataset_id, "success": True} for item in test]
+
+    monkeypatch.setattr(search, "evaluate_many", evaluate)
+    _outer_test(datasets, datasets, {"recipe": MatrixDecisions().to_dict()},
+                run_settings(), None, tmp_path, 0)
+    assert seen[0] == MatrixDecisions.optimized_flex()
+    assert seen[1] == MatrixDecisions.legacy_flex()
+    assert seen[0] != seen[1]

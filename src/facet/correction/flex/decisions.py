@@ -752,10 +752,12 @@ class WeightingPolicy:
 class MatrixDecisions:
     """Complete, independently configurable recipe for one matrix builder."""
 
-    quota: DirectionalQuota = field(default_factory=DirectionalQuota.future_only)
+    quota: DirectionalQuota = field(
+        default_factory=lambda: DirectionalQuota.custom(past=6, future=4, window_size=10)
+    )
     sampling: SamplingPolicy = field(default_factory=SamplingPolicy.consecutive)
     motion: MotionEligibility = field(default_factory=MotionEligibility)
-    target_policy: TargetPolicy = TargetPolicy.EXCLUDE
+    target_policy: TargetPolicy = TargetPolicy.INCLUDE
     scoring: CandidateScoringPolicy | None = None
     template_size: TemplateSizePolicy | None = None
     weighting: WeightingPolicy = field(default_factory=WeightingPolicy.equal)
@@ -777,7 +779,7 @@ class MatrixDecisions:
                 )
             scoring, template_size = self.correlation.to_decisions()
         elif scoring is None:
-            scoring = CandidateScoringPolicy.signed_pearson()
+            scoring = CandidateScoringPolicy.none()
 
         if not isinstance(scoring, CandidateScoringPolicy):
             raise MatrixDecisionError(
@@ -842,13 +844,21 @@ class MatrixDecisions:
             )
 
     @classmethod
+    def optimized_flex(cls) -> MatrixDecisions:
+        """NATVIEW five-fold optimum (structural_volume, 2c8dac1db45f353d6a7f).
+
+        Only matrix decisions were optimized; lifecycle settings are separate.
+        """
+        return cls()
+
+    @classmethod
     def legacy_flex(
         cls,
         *,
-        window_size: int,
-        threshold: float,
-        min_accepted: int,
-        distribution: str,
+        window_size: int = 10,
+        threshold: float = 0.975,
+        min_accepted: int = 5,
+        distribution: str = "equal",
         effective_window_size: int | None = None,
     ) -> MatrixDecisions:
         """Map the established four-argument Flex API onto the decision graph."""
@@ -898,7 +908,7 @@ class MatrixDecisions:
                 scoring=(
                     CandidateScoringPolicy.from_dict(value["scoring"])
                     if "scoring" in value
-                    else None
+                    else CandidateScoringPolicy.signed_pearson()
                 ),
                 template_size=(
                     TemplateSizePolicy.from_dict(value["template_size"])

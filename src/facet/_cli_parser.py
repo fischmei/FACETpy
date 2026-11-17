@@ -149,20 +149,20 @@ def _build_parser(
     process.add_argument(
         "--flex-threshold",
         type=float,
-        default=0.975,
-        help="Pearson correlation cutoff for --correction-mode=flex.",
+        default=None,
+        help="Select legacy Flex with this Pearson cutoff (legacy default: 0.975).",
     )
     process.add_argument(
         "--flex-min-accepted",
         type=int,
-        default=5,
-        help="Minimum candidate epochs averaged by --correction-mode=flex.",
+        default=None,
+        help="Select legacy Flex with this minimum template count (legacy default: 5).",
     )
     process.add_argument(
         "--flex-distribution",
         choices=("equal", "normal"),
-        default="equal",
-        help="Equal or temporal-normal averaging weights for --correction-mode=flex.",
+        default=None,
+        help="Select legacy Flex with equal or temporal-normal weights (legacy default: equal).",
     )
     process.add_argument(
         "--slices-per-volume",

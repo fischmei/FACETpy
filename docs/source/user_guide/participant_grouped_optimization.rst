@@ -93,13 +93,17 @@ Baselines and final recipe
 ----------------------------
 
 After persisting the selected outer recipe, the same outer test participants
-are evaluated with default ``MatrixDecisions()``, existing ``aas_per_target``
+are evaluated with the historical ``flex_default`` anchor (equivalent to
+``MatrixDecisions.legacy_flex()``), existing ``aas_per_target``
 and ``farm_per_target_k10`` anchors, and the optimized recipe. All use the same
 fixed downstream cleaning. Inspired anchors do not claim exact historical AAS
 or FARM reproduction. Paired optimized-minus-baseline participant differences
 are reported for both checkpoints. Positive deltas favor the optimized recipe
 for correlation/SNR; negative deltas favor it for errors/residuals. Test baseline
-values are descriptive and never tune the optimized configuration.
+values are descriptive and never tune the optimized configuration. The
+backward-compatible ``flex_default`` benchmark label always means the original
+future-first Pearson recipe, even though the library default now equals the
+``structural_volume`` anchor.
 
 Grouped CV does not automatically fit a final model. ``--final-only`` performs
 separate internal grouped selection on all participants and writes

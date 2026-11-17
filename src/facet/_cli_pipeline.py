@@ -32,6 +32,7 @@ from facet.correction.presets import (
     CORRESPONDING_SLICE,
     FARM_PER_TARGET_K10,
     FLEX_DEFAULT,
+    FLEX_LEGACY,
     LEGACY_RESEMBLANCE,
     MOOSMANN_COST,
     STRUCTURAL_SLICE,
@@ -147,14 +148,14 @@ def _build_template_correction(args: argparse.Namespace):
 
     if preset_name == FLEX_DEFAULT:
         window_size = 10 if args.window_size is None else args.window_size
-        weighting = (
+        weighting = None if args.flex_distribution is None else (
             WeightingPolicy.equal()
             if args.flex_distribution == "equal"
             else WeightingPolicy.gaussian(sigma=max(window_size / 3.0, 1.0))
         )
         decisions = build_flex_preset(
             preset_name,
-            window_size=window_size,
+            window_size=args.window_size,
             threshold=args.flex_threshold,
             template_size=args.flex_min_accepted,
             weighting=weighting,
@@ -193,10 +194,16 @@ def _build_template_correction(args: argparse.Namespace):
 
     processor = Flex(
         **common,
-        N_distribution=args.flex_distribution if preset_name == FLEX_DEFAULT else "equal",
+        N_distribution=(args.flex_distribution or "equal") if preset_name == FLEX_DEFAULT else "equal",
         interpolate_volume_gaps=args.interpolate_volume_gaps,
         matrix_decisions=decisions,
     )
+    if preset_name == FLEX_DEFAULT and any(
+        value is not None for value in (
+            args.window_size, args.flex_threshold, args.flex_min_accepted, args.flex_distribution,
+        )
+    ):
+        preset_name = FLEX_LEGACY
     processor.name = "flex_correction" if mode == "flex" else f"{mode.replace('-', '_')}_flex_correction"
     processor.flex_preset_name = preset_name
     processor.legacy_algorithm_resemblance = LEGACY_RESEMBLANCE[preset_name]

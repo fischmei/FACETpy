@@ -93,7 +93,7 @@ class TestFlexPublicAPI:
             "min_accepted",
             "N_distribution",
         ]
-        assert [parameter.default for parameter in parameters[:4]] == [10, 0.975, 5, "equal"]
+        assert [parameter.default for parameter in parameters[:4]] == [None, None, None, None]
 
     def test_parameters_are_canonical_and_constructor_compatible(self):
         """History parameters should recreate the exact processor configuration."""

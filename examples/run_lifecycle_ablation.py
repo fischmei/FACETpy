@@ -14,7 +14,8 @@ abnormal RMS or median-artifact ratio already exists before correction, or is
 introduced by one of the shared Flex lifecycle stages.
 
 By default, the fixed matrix recipe is ``MatrixDecisions()`` (the current Flex
-per-target default). Pass a fold's ``selected_recipe.json`` with
+6-past/4-future, no-scoring, equal-weight default). The historical results
+below predate this default change. Pass a fold's ``selected_recipe.json`` with
 ``--recipe-json`` to diagnose the exact recipe selected by optimization.
 
 Example
